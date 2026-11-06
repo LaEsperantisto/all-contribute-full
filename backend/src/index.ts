@@ -1,7 +1,9 @@
 import { DurableObject } from "cloudflare:workers";
+import { baseBlock } from "./terrain";
 
 export interface Env {
   DB: D1Database;
+  WORLD_LIVE: DurableObjectNamespace;
 }
 
 type User = { id: string; username: string };
@@ -22,11 +24,47 @@ const ABSOLUTE_TIMEOUT_MS = 30 * DAY_MS;
 // Touch at most once every 15 minutes to avoid a D1 write on every API request.
 const SESSION_TOUCH_INTERVAL_MS = 15 * 60 * 1000;
 
-// Keep this export because the original Cloudflare template created this class.
-// It is a placeholder until world-region simulation is implemented.
-export class MyDurableObject extends DurableObject<Env> {
-  async fetch(_request: Request): Promise<Response> {
-    return new Response("All Contribute Durable Object is ready!");
+// Live fan-out for the shared world: keeps connected players' WebSockets and
+// broadcasts each world edit. No hibernation (free tier): sockets live in
+// memory; clients reconnect after eviction and the sequence-numbered polling
+// fallback (world_log) fills any gaps, so delivery is best-effort but never
+// leaves a client permanently stale.
+export class WorldLive extends DurableObject<Env> {
+  sockets: WebSocket[] = [];
+
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+
+    if (request.method === "POST" && url.pathname === "/publish") {
+      const message = await request.json().catch(() => null);
+      if (message) this.broadcast(message);
+      return new Response("ok");
+    }
+
+    if (request.headers.get("Upgrade") === "websocket") {
+      const pair = new WebSocketPair();
+      const [client, server] = Object.values(pair);
+      server.accept();
+      this.sockets.push(server);
+      server.addEventListener("close", () => {
+        this.sockets = this.sockets.filter((socket) => socket !== server);
+      });
+      server.send(JSON.stringify({ type: "hello" }));
+      return new Response(null, { status: 101, webSocket: client });
+    }
+
+    return new Response("Expected a WebSocket upgrade.", { status: 426 });
+  }
+
+  broadcast(message: unknown): void {
+    const data = JSON.stringify(message);
+    for (const socket of this.sockets) {
+      try {
+        socket.send(data);
+      } catch {
+        // Dead sockets are pruned by their close listener.
+      }
+    }
   }
 }
 
@@ -206,11 +244,104 @@ function validColour(value: string): boolean {
 }
 const behaviours = new Set(["solid", "transparent", "glowing", "decorative"]);
 
+const validItemId = (value: string): boolean =>
+  validId(value) || /^player:[a-z0-9_]+:[a-z0-9_]+$/.test(value);
+
+// Placement semantics (ADR 0001): declarative rules only for now; executable
+// player behaviour versions alongside these later. Malformed rules NEVER throw:
+// they degrade to plain placement so one bad blob cannot crash the engine.
+type SupportRule = "any" | "solid" | "none";
+type BlockRules = { support: SupportRule; incompatibleWith: string[] };
+const supports: string[] = ["any", "solid", "none"];
+
+function parseRules(raw: unknown): BlockRules {
+  try {
+    const value = typeof raw === "string" ? JSON.parse(raw) : raw && typeof raw === "object" ? raw : {};
+    return {
+      support: supports.includes(value.support) ? value.support : "solid",
+      incompatibleWith: Array.isArray(value.incompatibleWith)
+        ? value.incompatibleWith.filter((id: unknown) => typeof id === "string" && validItemId(id)).slice(0, 32)
+        : []
+    };
+  } catch {
+    return { support: "solid", incompatibleWith: [] };
+  }
+}
+
+function rulesFromInput(raw: unknown): { rules: BlockRules; error: string | null } {
+  if (raw === undefined || raw === null) return { rules: parseRules({}), error: null };
+  if (typeof raw !== "object" || Array.isArray(raw)) return { rules: parseRules({}), error: "rules must be an object." };
+  const value = raw as { support?: unknown; incompatibleWith?: unknown };
+  if (value.support !== undefined && !supports.includes(String(value.support)))
+    return { rules: parseRules({}), error: "rules.support must be one of: any, solid, none." };
+  if (
+    value.incompatibleWith !== undefined &&
+    (!Array.isArray(value.incompatibleWith) || value.incompatibleWith.length > 32 ||
+      value.incompatibleWith.some((id) => typeof id !== "string" || !validItemId(id)))
+  )
+    return { rules: parseRules({}), error: "rules.incompatibleWith must be an array of up to 32 valid item IDs." };
+  return { rules: parseRules(value), error: null };
+}
+
+const cellKey = (x: number, y: number) => `${x},${y}`;
+
+type EditRow = { x: number; y: number; block_id: string };
+
+// Resolve each cell's occupant: player edits override the deterministic base terrain.
+async function resolveCells(env: Env, cells: Array<[number, number]>): Promise<Map<string, string>> {
+  const where = cells.map(() => "(x=? AND y=?)").join(" OR ");
+  const params: number[] = [];
+  for (const [x, y] of cells) params.push(x, y);
+  const { results } = await env.DB
+    .prepare(`SELECT x,y,block_id FROM world_edits WHERE ${where}`)
+    .bind(...params)
+    .all<EditRow>();
+  const overrides = new Map(results.map(row => [cellKey(row.x, row.y), row.block_id]));
+  const resolved = new Map<string, string>();
+  for (const [x, y] of cells) {
+    const override = overrides.get(cellKey(x, y));
+    resolved.set(cellKey(x, y), override !== undefined ? override : baseBlock(x, y));
+  }
+  return resolved;
+}
+
+async function publishEdit(env: Env, x: number, y: number, blockId: string): Promise<void> {
+  try {
+    const stub = env.WORLD_LIVE.get(env.WORLD_LIVE.idFromName("world"));
+    await stub.fetch(
+      new Request("https://world-live.internal/publish", {
+        method: "POST",
+        body: JSON.stringify({ type: "edit", x, y, block_id: blockId })
+      })
+    );
+  } catch (error) {
+    console.error("World broadcast failed:", error);
+  }
+}
+
+const WORLD_COORD_LIMIT = 1_000_000;
+function worldCoords(data: { x: unknown; y: unknown }): { x: number; y: number } | null {
+  const x = Number(data.x);
+  const y = Number(data.y);
+  if (!Number.isInteger(x) || !Number.isInteger(y) ||
+      x < -WORLD_COORD_LIMIT || x > WORLD_COORD_LIMIT || y < -WORLD_COORD_LIMIT || y > WORLD_COORD_LIMIT)
+    return null;
+  return { x, y };
+}
+
+type BlockRow = {
+  id: string; name: string; creator: string; hardness: number; light: number;
+  colour: string; behaviour: string; rules_json: string; is_builtin: number;
+};
+
 async function listBlocks(env: Env): Promise<unknown[]> {
   const { results } = await env.DB.prepare(
-    "SELECT id,name,creator_name AS creator,hardness,light,colour,behaviour,is_builtin FROM blocks ORDER BY is_builtin DESC,name LIMIT 500"
-  ).all();
-  return results;
+    "SELECT id,name,creator_name AS creator,hardness,light,colour,behaviour,rules_json,is_builtin FROM blocks ORDER BY is_builtin DESC,name LIMIT 500"
+  ).all<BlockRow>();
+  return results.map(row => ({
+    id: row.id, name: row.name, creator: row.creator, hardness: row.hardness, light: row.light,
+    colour: row.colour, behaviour: row.behaviour, is_builtin: row.is_builtin, rules: parseRules(row.rules_json)
+  }));
 }
 
 async function listRecipes(env: Env): Promise<unknown[]> {
@@ -218,6 +349,135 @@ async function listRecipes(env: Env): Promise<unknown[]> {
     "SELECT id,name,creator_name AS creator,ingredients_json,result_id,quantity FROM recipes ORDER BY created_at DESC LIMIT 500"
   ).all<any>();
   return results.map(row => ({ ...row, ingredients: JSON.parse(row.ingredients_json) }));
+}
+
+type StackRow = { quantity: number };
+type RecipeRow = { id: string; name: string; ingredients_json: string; result_id: string; quantity: number };
+type LogRow = { seq: number; x: number; y: number; block_id: string };
+
+// The placement engine (ADR 0001): validation as data, refusals return the item
+// to the player (nothing is debited on refusal), and every path returns a
+// Response — a malformed definition can degrade, never crash the world.
+async function handlePlace(request: Request, env: Env, origin: string | null): Promise<Response> {
+  const auth = await authenticate(request, env);
+  if (!auth) return err("Log in first.", 401, origin);
+  const data = await body<{ x: unknown; y: unknown; item_id: unknown }>(request);
+  const coords = worldCoords(data);
+  if (!coords) return err("Coordinates must be integers within ±1000000.", 400, origin);
+  const { x, y } = coords;
+  const itemId = typeof data.item_id === "string" ? data.item_id.trim() : "";
+  if (!validItemId(itemId)) return err("Invalid item ID.", 400, origin);
+
+  const def = await env.DB.prepare("SELECT id, rules_json FROM blocks WHERE id = ?").bind(itemId).first<{ id: string; rules_json: string }>();
+  if (!def) return err(`Unknown item "${itemId}". It must exist in the block registry before it can be placed.`, 400, origin);
+
+  const rules = parseRules(def.rules_json);
+  const neighbours: Array<[number, number]> = [[x - 1, y], [x + 1, y], [x, y - 1], [x, y + 1]];
+  const cells = await resolveCells(env, [[x, y], ...neighbours]);
+
+  if (cells.get(cellKey(x, y)) !== "air")
+    return json({ error: "That cell is already occupied.", code: "occupied" }, 409, origin);
+  if (rules.support === "solid" && cells.get(cellKey(x, y + 1)) === "air")
+    return json({ error: `${def.id} can only be placed on a solid surface.`, code: "no_support" }, 400, origin);
+  if (rules.support === "none" && cells.get(cellKey(x, y + 1)) !== "air")
+    return json({ error: `${def.id} needs empty space beneath it.`, code: "no_support" }, 400, origin);
+  for (const [nx, ny] of neighbours) {
+    const neighbour = cells.get(cellKey(nx, ny))!;
+    if (rules.incompatibleWith.includes(neighbour))
+      return json({
+        error: `${def.id} refuses to touch ${neighbour}. Placement cancelled; the item stayed in your inventory.`,
+        code: "incompatible"
+      }, 409, origin);
+  }
+
+  const debit = await env.DB.prepare(
+    "UPDATE inventories SET quantity=quantity-1, updated_at=CURRENT_TIMESTAMP WHERE user_id=? AND item_id=? AND quantity>=1"
+  ).bind(auth.user.id, itemId).run();
+  if (!debit.meta.changes)
+    return json({ error: `You have no ${itemId} in your inventory.`, code: "no_item" }, 400, origin);
+
+  await env.DB.batch([
+    env.DB.prepare(
+      "INSERT INTO world_edits(x,y,block_id,placed_by) VALUES(?,?,?,?) ON CONFLICT(x,y) DO UPDATE SET block_id=excluded.block_id, placed_by=excluded.placed_by, created_at=CURRENT_TIMESTAMP"
+    ).bind(x, y, itemId, auth.user.id),
+    env.DB.prepare("INSERT INTO world_log(x,y,block_id) VALUES(?,?,?)").bind(x, y, itemId)
+  ]);
+  await publishEdit(env, x, y, itemId);
+  return json({ ok: true, x, y, id: itemId }, 201, origin);
+}
+
+async function handleBreak(request: Request, env: Env, origin: string | null): Promise<Response> {
+  const auth = await authenticate(request, env);
+  if (!auth) return err("Log in first.", 401, origin);
+  const data = await body<{ x: unknown; y: unknown }>(request);
+  const coords = worldCoords(data);
+  if (!coords) return err("Coordinates must be integers within ±1000000.", 400, origin);
+  const { x, y } = coords;
+
+  const cells = await resolveCells(env, [[x, y]]);
+  const current = cells.get(cellKey(x, y))!;
+  if (current === "air") return json({ error: "Nothing to break there.", code: "empty" }, 409, origin);
+
+  const stack = await env.DB.prepare("SELECT quantity FROM inventories WHERE user_id=? AND item_id=?").bind(auth.user.id, current).first<StackRow>();
+  if (stack && stack.quantity >= 999)
+    return json({ error: "That stack is full (999). Make room before breaking more.", code: "inventory_full" }, 400, origin);
+
+  await env.DB.batch([
+    env.DB.prepare(
+      "INSERT INTO inventories(user_id,item_id,quantity) VALUES(?,?,1) ON CONFLICT(user_id,item_id) DO UPDATE SET quantity=quantity+1, updated_at=CURRENT_TIMESTAMP"
+    ).bind(auth.user.id, current),
+    env.DB.prepare(
+      "INSERT INTO world_edits(x,y,block_id,placed_by) VALUES(?,?,?,?) ON CONFLICT(x,y) DO UPDATE SET block_id='air', placed_by=excluded.placed_by, created_at=CURRENT_TIMESTAMP"
+    ).bind(x, y, "air", auth.user.id),
+    env.DB.prepare("INSERT INTO world_log(x,y,block_id) VALUES(?,?,?)").bind(x, y, "air")
+  ]);
+  await publishEdit(env, x, y, "air");
+  return json({ ok: true, x, y, dropped: current }, 200, origin);
+}
+
+async function handleCraft(request: Request, env: Env, origin: string | null): Promise<Response> {
+  const auth = await authenticate(request, env);
+  if (!auth) return err("Log in first.", 401, origin);
+  const data = await body<{ recipe_id: unknown }>(request);
+  const recipeId = typeof data.recipe_id === "string" ? data.recipe_id : "";
+  if (!/^[0-9a-f-]{36}$/i.test(recipeId)) return err("Invalid recipe id.", 400, origin);
+
+  const recipe = await env.DB.prepare("SELECT id,name,ingredients_json,result_id,quantity FROM recipes WHERE id=?").bind(recipeId).first<RecipeRow>();
+  if (!recipe) return err("Recipe not found.", 404, origin);
+
+  const resultRegistered = await env.DB.prepare("SELECT id FROM blocks WHERE id=?").bind(recipe.result_id).first();
+  if (!resultRegistered)
+    return json({ error: `The result "${recipe.result_id}" is not in the block registry, so it cannot be crafted.`, code: "unknown_result" }, 409, origin);
+
+  const required = new Map<string, number>();
+  try {
+    const parsed: unknown = JSON.parse(recipe.ingredients_json);
+    if (Array.isArray(parsed))
+      for (const id of parsed) if (typeof id === "string") required.set(id, (required.get(id) || 0) + 1);
+  } catch {
+    return json({ error: "This recipe's ingredients are corrupted and cannot be used.", code: "corrupt" }, 409, origin);
+  }
+
+  const invRows = await env.DB
+    .prepare("SELECT item_id, quantity FROM inventories WHERE user_id=?")
+    .bind(auth.user.id)
+    .all<{ item_id: string; quantity: number }>();
+  const have = new Map(invRows.results.map(row => [row.item_id, row.quantity]));
+  for (const [id, need] of required) {
+    if ((have.get(id) || 0) < need)
+      return json({ error: `Missing ${id} ×${need - (have.get(id) || 0)}.`, code: "missing" }, 400, origin);
+  }
+  if ((have.get(recipe.result_id) || 0) + recipe.quantity > 999)
+    return json({ error: "The result stack would exceed 999. Make room first.", code: "inventory_full" }, 400, origin);
+
+  const statements = [...required].map(([id, need]) =>
+    env.DB.prepare("UPDATE inventories SET quantity=quantity-?, updated_at=CURRENT_TIMESTAMP WHERE user_id=? AND item_id=? AND quantity>=?")
+      .bind(need, auth.user.id, id, need));
+  statements.push(env.DB.prepare(
+    "INSERT INTO inventories(user_id,item_id,quantity) VALUES(?,?,?) ON CONFLICT(user_id,item_id) DO UPDATE SET quantity=quantity+?, updated_at=CURRENT_TIMESTAMP"
+  ).bind(auth.user.id, recipe.result_id, recipe.quantity, recipe.quantity));
+  await env.DB.batch(statements);
+  return json({ ok: true, id: recipe.result_id, quantity: recipe.quantity }, 200, origin);
 }
 
 export default {
@@ -348,11 +608,13 @@ export default {
         if (!Number.isFinite(hardness) || hardness < 0 || hardness > 1000) return err("Hardness must be 0–1000.", 400, origin);
         if (!Number.isInteger(light) || light < 0 || light > 15) return err("Light must be an integer from 0 to 15.", 400, origin);
         if (!validColour(colour) || !behaviours.has(behaviour)) return err("Invalid colour or behaviour.", 400, origin);
+        const { rules, error: rulesError } = rulesFromInput(data.rules);
+        if (rulesError) return err(`Invalid placement rules: ${rulesError}`, 400, origin);
         const fullId = `player:${auth.user.username.toLowerCase()}:${id}`;
         try {
           await env.DB.prepare(
-            "INSERT INTO blocks(id,name,creator_id,creator_name,hardness,light,colour,behaviour,is_builtin) VALUES(?,?,?,?,?,?,?,?,0)"
-          ).bind(fullId, name, auth.user.id, auth.user.username, hardness, light, colour, behaviour).run();
+            "INSERT INTO blocks(id,name,creator_id,creator_name,hardness,light,colour,behaviour,rules_json,is_builtin) VALUES(?,?,?,?,?,?,?,?,?,0)"
+          ).bind(fullId, name, auth.user.id, auth.user.username, hardness, light, colour, behaviour, JSON.stringify(rules)).run();
         } catch {
           return err("That block ID already exists.", 409, origin);
         }
@@ -380,9 +642,11 @@ export default {
             !Number.isInteger(light) || light < 0 || light > 15 || !validColour(colour) || !behaviours.has(behaviour)) {
           return err("Invalid block fields.", 400, origin);
         }
+        const { rules, error: rulesError } = rulesFromInput(data.rules);
+        if (rulesError) return err(`Invalid placement rules: ${rulesError}`, 400, origin);
         await env.DB.prepare(
-          "UPDATE blocks SET name=?,hardness=?,light=?,colour=?,behaviour=?,updated_at=CURRENT_TIMESTAMP WHERE id=?"
-        ).bind(name, hardness, light, colour, behaviour, id).run();
+          "UPDATE blocks SET name=?,hardness=?,light=?,colour=?,behaviour=?,rules_json=?,updated_at=CURRENT_TIMESTAMP WHERE id=?"
+        ).bind(name, hardness, light, colour, behaviour, JSON.stringify(rules), id).run();
         return json({ ok: true }, 200, origin);
       }
 
@@ -398,7 +662,6 @@ export default {
         const ingredients: string[] = Array.isArray(data.ingredients) ? data.ingredients.map((value: unknown) => String(value)) : [];
         const resultId = String(data.result_id || "").trim();
         const quantity = Number(data.quantity);
-        const validItemId = (value: string) => validId(value) || /^player:[a-z0-9_]+:[a-z0-9_]+$/.test(value);
         if (name.length < 1 || name.length > 60 || ingredients.length < 1 || ingredients.length > 9 ||
             ingredients.some(value => !validItemId(value)) || !validItemId(resultId) ||
             !Number.isInteger(quantity) || quantity < 1 || quantity > 999) {
@@ -410,6 +673,74 @@ export default {
         ).bind(id, name, auth.user.id, auth.user.username, JSON.stringify(ingredients), resultId, quantity).run();
         return json({ ok: true, id }, 201, origin);
       }
+
+      // ---- Shared world --------------------------------------------------------
+      if (path === "/api/world/live" && request.headers.get("Upgrade") === "websocket") {
+        const stub = env.WORLD_LIVE.get(env.WORLD_LIVE.idFromName("world"));
+        return stub.fetch(request);
+      }
+
+      if (path === "/api/world" && request.method === "GET") {
+        const coord = (name: string): number => {
+          const value = Number(url.searchParams.get(name));
+          return Number.isInteger(value) && value >= -WORLD_COORD_LIMIT && value <= WORLD_COORD_LIMIT ? value : 0;
+        };
+        const x0 = coord("x0"), y0 = coord("y0"), x1 = coord("x1"), y1 = coord("y1");
+        if (x1 < x0 || y1 < y0 || (x1 - x0 + 1) * (y1 - y0 + 1) > 4096) return err("World window is invalid (max 4096 cells).", 400, origin);
+        const since = Number(url.searchParams.get("since")) || 0;
+        const [edits, log, head] = await Promise.all([
+          env.DB.prepare("SELECT x,y,block_id FROM world_edits WHERE x BETWEEN ? AND ? AND y BETWEEN ? AND ? LIMIT 4096")
+            .bind(x0, x1, y0, y1).all<EditRow>(),
+          env.DB.prepare("SELECT seq,x,y,block_id FROM world_log WHERE seq > ? ORDER BY seq ASC LIMIT 400")
+            .bind(since).all<LogRow>(),
+          env.DB.prepare("SELECT COALESCE(MAX(seq), 0) AS head FROM world_log").first<{ head: number }>()
+        ]);
+        return json({ edits: edits.results, log: log.results, head: head?.head ?? 0 }, 200, origin);
+      }
+
+      if (path === "/api/world/place" && request.method === "POST") return handlePlace(request, env, origin);
+      if (path === "/api/world/break" && request.method === "POST") return handleBreak(request, env, origin);
+
+      // ---- Inventory ------------------------------------------------------------
+      if (path === "/api/inventory" && request.method === "GET") {
+        const auth = await authenticate(request, env);
+        if (!auth) return err("Log in first.", 401, origin);
+        const { results } = await env.DB
+          .prepare("SELECT item_id, quantity FROM inventories WHERE user_id=? AND quantity>0 ORDER BY item_id")
+          .bind(auth.user.id).all<{ item_id: string; quantity: number }>();
+        return json({ inventory: results }, 200, origin);
+      }
+
+      if ((path === "/api/inventory/add" || path === "/api/inventory/remove") && request.method === "POST") {
+        const auth = await authenticate(request, env);
+        if (!auth) return err("Log in first.", 401, origin);
+        const data = await body<{ item_id: unknown; quantity: unknown }>(request);
+        const itemId = typeof data.item_id === "string" ? data.item_id.trim().toLowerCase() : "";
+        const quantity = Number(data.quantity);
+        if (!validItemId(itemId)) return err("Use 1–48 letters, numbers, underscores, colons or hyphens for the item ID.", 400, origin);
+        if (!Number.isInteger(quantity) || quantity < 1 || quantity > 999) return err("Quantity must be between 1 and 999.", 400, origin);
+        if (path === "/api/inventory/add") {
+          await env.DB.prepare(
+            "INSERT INTO inventories(user_id,item_id,quantity) VALUES(?,?,?) ON CONFLICT(user_id,item_id) DO UPDATE SET quantity=min(999, quantity+?), updated_at=CURRENT_TIMESTAMP"
+          ).bind(auth.user.id, itemId, quantity, quantity).run();
+        } else {
+          const removed = await env.DB.prepare(
+            "UPDATE inventories SET quantity=quantity-?, updated_at=CURRENT_TIMESTAMP WHERE user_id=? AND item_id=? AND quantity>=?"
+          ).bind(quantity, auth.user.id, itemId, quantity).run();
+          if (!removed.meta.changes) return err(`You do not have ${quantity} × ${itemId}.`, 400, origin);
+          await env.DB.prepare("DELETE FROM inventories WHERE user_id=? AND item_id=? AND quantity<=0").bind(auth.user.id, itemId).run();
+        }
+        return json({ ok: true }, 200, origin);
+      }
+
+      if (path === "/api/inventory/clear" && request.method === "POST") {
+        const auth = await authenticate(request, env);
+        if (!auth) return err("Log in first.", 401, origin);
+        await env.DB.prepare("DELETE FROM inventories WHERE user_id=?").bind(auth.user.id).run();
+        return json({ ok: true }, 200, origin);
+      }
+
+      if (path === "/api/recipes/craft" && request.method === "POST") return handleCraft(request, env, origin);
 
       return err("Not found.", 404, origin);
     } catch (error) {

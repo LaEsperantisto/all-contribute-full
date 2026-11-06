@@ -10,5 +10,19 @@
       "database_name": "all-contribute-db",
       "database_id": "d212f802-d22b-48e1-8246-1e114a85f3ae"
     }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "WORLD_LIVE",
+        "class_name": "WorldLive"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["WorldLive"]
+    }
   ]
 }
