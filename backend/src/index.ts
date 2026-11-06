@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { baseBlock } from "./terrain";
+import { baseBlock, WORLD_Y } from "./terrain";
 
 export interface Env {
   DB: D1Database;
@@ -283,35 +283,35 @@ function rulesFromInput(raw: unknown): { rules: BlockRules; error: string | null
   return { rules: parseRules(value), error: null };
 }
 
-const cellKey = (x: number, y: number) => `${x},${y}`;
+const cellKey = (x: number, y: number, z: number) => `${x},${y},${z}`;
 
-type EditRow = { x: number; y: number; block_id: string };
+type EditRow = { x: number; y: number; z: number; block_id: string };
 
 // Resolve each cell's occupant: player edits override the deterministic base terrain.
-async function resolveCells(env: Env, cells: Array<[number, number]>): Promise<Map<string, string>> {
-  const where = cells.map(() => "(x=? AND y=?)").join(" OR ");
+async function resolveCells(env: Env, cells: Array<[number, number, number]>): Promise<Map<string, string>> {
+  const where = cells.map(() => "(x=? AND y=? AND z=?)").join(" OR ");
   const params: number[] = [];
-  for (const [x, y] of cells) params.push(x, y);
+  for (const [x, y, z] of cells) params.push(x, y, z);
   const { results } = await env.DB
-    .prepare(`SELECT x,y,block_id FROM world_edits WHERE ${where}`)
+    .prepare(`SELECT x,y,z,block_id FROM world_edits WHERE ${where}`)
     .bind(...params)
     .all<EditRow>();
-  const overrides = new Map(results.map(row => [cellKey(row.x, row.y), row.block_id]));
+  const overrides = new Map(results.map(row => [cellKey(row.x, row.y, row.z), row.block_id]));
   const resolved = new Map<string, string>();
-  for (const [x, y] of cells) {
-    const override = overrides.get(cellKey(x, y));
-    resolved.set(cellKey(x, y), override !== undefined ? override : baseBlock(x, y));
+  for (const [x, y, z] of cells) {
+    const override = overrides.get(cellKey(x, y, z));
+    resolved.set(cellKey(x, y, z), override !== undefined ? override : baseBlock(x, y, z));
   }
   return resolved;
 }
 
-async function publishEdit(env: Env, x: number, y: number, blockId: string): Promise<void> {
+async function publishEdit(env: Env, x: number, y: number, z: number, blockId: string): Promise<void> {
   try {
     const stub = env.WORLD_LIVE.get(env.WORLD_LIVE.idFromName("world"));
     await stub.fetch(
       new Request("https://world-live.internal/publish", {
         method: "POST",
-        body: JSON.stringify({ type: "edit", x, y, block_id: blockId })
+        body: JSON.stringify({ type: "edit", x, y, z, block_id: blockId })
       })
     );
   } catch (error) {
@@ -320,13 +320,15 @@ async function publishEdit(env: Env, x: number, y: number, blockId: string): Pro
 }
 
 const WORLD_COORD_LIMIT = 1_000_000;
-function worldCoords(data: { x: unknown; y: unknown }): { x: number; y: number } | null {
+function worldCoords(data: { x: unknown; y: unknown; z: unknown }): { x: number; y: number; z: number } | null {
   const x = Number(data.x);
   const y = Number(data.y);
-  if (!Number.isInteger(x) || !Number.isInteger(y) ||
-      x < -WORLD_COORD_LIMIT || x > WORLD_COORD_LIMIT || y < -WORLD_COORD_LIMIT || y > WORLD_COORD_LIMIT)
+  const z = Number(data.z);
+  if (!Number.isInteger(x) || !Number.isInteger(y) || !Number.isInteger(z) ||
+      x < -WORLD_COORD_LIMIT || x > WORLD_COORD_LIMIT || z < -WORLD_COORD_LIMIT || z > WORLD_COORD_LIMIT ||
+      y < 0 || y >= WORLD_Y)
     return null;
-  return { x, y };
+  return { x, y, z };
 }
 
 type BlockRow = {
@@ -353,7 +355,7 @@ async function listRecipes(env: Env): Promise<unknown[]> {
 
 type StackRow = { quantity: number };
 type RecipeRow = { id: string; name: string; ingredients_json: string; result_id: string; quantity: number };
-type LogRow = { seq: number; x: number; y: number; block_id: string };
+type LogRow = { seq: number; x: number; y: number; z: number; block_id: string };
 
 // The placement engine (ADR 0001): validation as data, refusals return the item
 // to the player (nothing is debited on refusal), and every path returns a
@@ -361,10 +363,10 @@ type LogRow = { seq: number; x: number; y: number; block_id: string };
 async function handlePlace(request: Request, env: Env, origin: string | null): Promise<Response> {
   const auth = await authenticate(request, env);
   if (!auth) return err("Log in first.", 401, origin);
-  const data = await body<{ x: unknown; y: unknown; item_id: unknown }>(request);
+  const data = await body<{ x: unknown; y: unknown; z: unknown; item_id: unknown }>(request);
   const coords = worldCoords(data);
-  if (!coords) return err("Coordinates must be integers within ±1000000.", 400, origin);
-  const { x, y } = coords;
+  if (!coords) return err(`Coordinates must be integers (x/z within ±1000000, y within 0..${WORLD_Y - 1}).`, 400, origin);
+  const { x, y, z } = coords;
   const itemId = typeof data.item_id === "string" ? data.item_id.trim() : "";
   if (!validItemId(itemId)) return err("Invalid item ID.", 400, origin);
 
@@ -372,17 +374,19 @@ async function handlePlace(request: Request, env: Env, origin: string | null): P
   if (!def) return err(`Unknown item "${itemId}". It must exist in the block registry before it can be placed.`, 400, origin);
 
   const rules = parseRules(def.rules_json);
-  const neighbours: Array<[number, number]> = [[x - 1, y], [x + 1, y], [x, y - 1], [x, y + 1]];
-  const cells = await resolveCells(env, [[x, y], ...neighbours]);
+  const neighbours: Array<[number, number, number]> = [
+    [x - 1, y, z], [x + 1, y, z], [x, y, z - 1], [x, y, z + 1], [x, y - 1, z], [x, y + 1, z]
+  ];
+  const cells = await resolveCells(env, [[x, y, z], ...neighbours]);
 
-  if (cells.get(cellKey(x, y)) !== "air")
+  if (cells.get(cellKey(x, y, z)) !== "air")
     return json({ error: "That cell is already occupied.", code: "occupied" }, 409, origin);
-  if (rules.support === "solid" && cells.get(cellKey(x, y + 1)) === "air")
+  if (rules.support === "solid" && cells.get(cellKey(x, y - 1, z)) === "air")
     return json({ error: `${def.id} can only be placed on a solid surface.`, code: "no_support" }, 400, origin);
-  if (rules.support === "none" && cells.get(cellKey(x, y + 1)) !== "air")
+  if (rules.support === "none" && cells.get(cellKey(x, y - 1, z)) !== "air")
     return json({ error: `${def.id} needs empty space beneath it.`, code: "no_support" }, 400, origin);
-  for (const [nx, ny] of neighbours) {
-    const neighbour = cells.get(cellKey(nx, ny))!;
+  for (const [nx, ny, nz] of neighbours) {
+    const neighbour = cells.get(cellKey(nx, ny, nz))!;
     if (rules.incompatibleWith.includes(neighbour))
       return json({
         error: `${def.id} refuses to touch ${neighbour}. Placement cancelled; the item stayed in your inventory.`,
@@ -398,25 +402,27 @@ async function handlePlace(request: Request, env: Env, origin: string | null): P
 
   await env.DB.batch([
     env.DB.prepare(
-      "INSERT INTO world_edits(x,y,block_id,placed_by) VALUES(?,?,?,?) ON CONFLICT(x,y) DO UPDATE SET block_id=excluded.block_id, placed_by=excluded.placed_by, created_at=CURRENT_TIMESTAMP"
-    ).bind(x, y, itemId, auth.user.id),
-    env.DB.prepare("INSERT INTO world_log(x,y,block_id) VALUES(?,?,?)").bind(x, y, itemId)
+      "INSERT INTO world_edits(x,y,z,block_id,placed_by) VALUES(?,?,?,?,?) ON CONFLICT(x,y,z) DO UPDATE SET block_id=excluded.block_id, placed_by=excluded.placed_by, created_at=CURRENT_TIMESTAMP"
+    ).bind(x, y, z, itemId, auth.user.id),
+    env.DB.prepare("INSERT INTO world_log(x,y,z,block_id) VALUES(?,?,?,?)").bind(x, y, z, itemId)
   ]);
-  await publishEdit(env, x, y, itemId);
-  return json({ ok: true, x, y, id: itemId }, 201, origin);
+  await publishEdit(env, x, y, z, itemId);
+  return json({ ok: true, x, y, z, id: itemId }, 201, origin);
 }
 
 async function handleBreak(request: Request, env: Env, origin: string | null): Promise<Response> {
   const auth = await authenticate(request, env);
   if (!auth) return err("Log in first.", 401, origin);
-  const data = await body<{ x: unknown; y: unknown }>(request);
+  const data = await body<{ x: unknown; y: unknown; z: unknown }>(request);
   const coords = worldCoords(data);
-  if (!coords) return err("Coordinates must be integers within ±1000000.", 400, origin);
-  const { x, y } = coords;
+  if (!coords) return err(`Coordinates must be integers (x/z within ±1000000, y within 0..${WORLD_Y - 1}).`, 400, origin);
+  const { x, y, z } = coords;
 
-  const cells = await resolveCells(env, [[x, y]]);
-  const current = cells.get(cellKey(x, y))!;
+  const cells = await resolveCells(env, [[x, y, z]]);
+  const current = cells.get(cellKey(x, y, z))!;
   if (current === "air") return json({ error: "Nothing to break there.", code: "empty" }, 409, origin);
+  if (current === "builtin:bedrock")
+    return json({ error: "Bedrock is unbreakable.", code: "unbreakable" }, 400, origin);
 
   const stack = await env.DB.prepare("SELECT quantity FROM inventories WHERE user_id=? AND item_id=?").bind(auth.user.id, current).first<StackRow>();
   if (stack && stack.quantity >= 999)
@@ -427,12 +433,12 @@ async function handleBreak(request: Request, env: Env, origin: string | null): P
       "INSERT INTO inventories(user_id,item_id,quantity) VALUES(?,?,1) ON CONFLICT(user_id,item_id) DO UPDATE SET quantity=quantity+1, updated_at=CURRENT_TIMESTAMP"
     ).bind(auth.user.id, current),
     env.DB.prepare(
-      "INSERT INTO world_edits(x,y,block_id,placed_by) VALUES(?,?,?,?) ON CONFLICT(x,y) DO UPDATE SET block_id='air', placed_by=excluded.placed_by, created_at=CURRENT_TIMESTAMP"
-    ).bind(x, y, "air", auth.user.id),
-    env.DB.prepare("INSERT INTO world_log(x,y,block_id) VALUES(?,?,?)").bind(x, y, "air")
+      "INSERT INTO world_edits(x,y,z,block_id,placed_by) VALUES(?,?,?,?,?) ON CONFLICT(x,y,z) DO UPDATE SET block_id='air', placed_by=excluded.placed_by, created_at=CURRENT_TIMESTAMP"
+    ).bind(x, y, z, "air", auth.user.id),
+    env.DB.prepare("INSERT INTO world_log(x,y,z,block_id) VALUES(?,?,?,?)").bind(x, y, z, "air")
   ]);
-  await publishEdit(env, x, y, "air");
-  return json({ ok: true, x, y, dropped: current }, 200, origin);
+  await publishEdit(env, x, y, z, "air");
+  return json({ ok: true, x, y, z, dropped: current }, 200, origin);
 }
 
 async function handleCraft(request: Request, env: Env, origin: string | null): Promise<Response> {
@@ -650,6 +656,31 @@ export default {
         return json({ ok: true }, 200, origin);
       }
 
+      if (blockMatch && request.method === "DELETE") {
+        const auth = await authenticate(request, env);
+        if (!auth) return err("Log in first.", 401, origin);
+        const id = decodeURIComponent(blockMatch[1]);
+        const existing = await env.DB.prepare(
+          "SELECT creator_id,is_builtin FROM blocks WHERE id=?"
+        ).bind(id).first<any>();
+        if (!existing) return err("Block not found.", 404, origin);
+        if (existing.is_builtin) return err("Built-in blocks are immutable.", 403, origin);
+        if (existing.creator_id !== auth.user.id) return err("Only the creator can delete this block.", 403, origin);
+        const refs = await env.DB.prepare(
+          "SELECT (SELECT COUNT(*) FROM recipes WHERE result_id=? OR ingredients_json LIKE ?) AS recipe_refs, (SELECT COUNT(*) FROM world_edits WHERE block_id=?) AS placed"
+        ).bind(id, `%"${id}"%`, id).first<{ recipe_refs: number; placed: number }>();
+        if (refs && (refs.recipe_refs > 0 || refs.placed > 0)) {
+          const parts: string[] = [];
+          if (refs.placed > 0) parts.push(`${refs.placed} placed block(s)`);
+          if (refs.recipe_refs > 0) parts.push(`${refs.recipe_refs} recipe(s)`);
+          return err(`Block is still in use: ${parts.join(" and ")}. Clear those first.`, 409, origin);
+        }
+        await env.DB.prepare("DELETE FROM blocks WHERE id=?").bind(id).run();
+        // Stale inventory stacks for a block that no longer exists are dead weight.
+        await env.DB.prepare("DELETE FROM inventories WHERE item_id=?").bind(id).run();
+        return json({ ok: true }, 200, origin);
+      }
+
       if (path === "/api/recipes" && request.method === "GET") {
         return json({ recipes: await listRecipes(env) }, 200, origin);
       }
@@ -685,13 +716,17 @@ export default {
           const value = Number(url.searchParams.get(name));
           return Number.isInteger(value) && value >= -WORLD_COORD_LIMIT && value <= WORLD_COORD_LIMIT ? value : 0;
         };
-        const x0 = coord("x0"), y0 = coord("y0"), x1 = coord("x1"), y1 = coord("y1");
-        if (x1 < x0 || y1 < y0 || (x1 - x0 + 1) * (y1 - y0 + 1) > 4096) return err("World window is invalid (max 4096 cells).", 400, origin);
+        const x0 = coord("x0"), y0 = coord("y0"), z0 = coord("z0");
+        const x1 = coord("x1"), y1 = coord("y1"), z1 = coord("z1");
+        if (x1 < x0 || y1 < y0 || z1 < z0) return err("World window is invalid.", 400, origin);
         const since = Number(url.searchParams.get("since")) || 0;
+        // Player edits are sparse overlays of the procedural base — a volume
+        // query returns only the changed cells, capped well above any sane
+        // active-world edit count.
         const [edits, log, head] = await Promise.all([
-          env.DB.prepare("SELECT x,y,block_id FROM world_edits WHERE x BETWEEN ? AND ? AND y BETWEEN ? AND ? LIMIT 4096")
-            .bind(x0, x1, y0, y1).all<EditRow>(),
-          env.DB.prepare("SELECT seq,x,y,block_id FROM world_log WHERE seq > ? ORDER BY seq ASC LIMIT 400")
+          env.DB.prepare("SELECT x,y,z,block_id FROM world_edits WHERE x BETWEEN ? AND ? AND y BETWEEN ? AND ? AND z BETWEEN ? AND ? LIMIT 20000")
+            .bind(x0, x1, y0, y1, z0, z1).all<EditRow>(),
+          env.DB.prepare("SELECT seq,x,y,z,block_id FROM world_log WHERE seq > ? ORDER BY seq ASC LIMIT 400")
             .bind(since).all<LogRow>(),
           env.DB.prepare("SELECT COALESCE(MAX(seq), 0) AS head FROM world_log").first<{ head: number }>()
         ]);

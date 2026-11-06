@@ -57,13 +57,15 @@ CREATE TABLE IF NOT EXISTS inventories (
 -- The shared world: base terrain is a deterministic function of coordinates
 -- (backend/src/terrain.ts, mirrored in frontend), and player edits are the
 -- only stored state. block_id 'air' marks a cell explicitly cleared.
+-- Coordinates are 3D with y growing upward (world model v2).
 CREATE TABLE IF NOT EXISTS world_edits (
   x INTEGER NOT NULL,
   y INTEGER NOT NULL,
+  z INTEGER NOT NULL,
   block_id TEXT NOT NULL,
   placed_by TEXT REFERENCES users(id),
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  PRIMARY KEY (x, y)
+  PRIMARY KEY (x, y, z)
 );
 
 -- Sequence-numbered change feed for live sync (WS broadcast + polling fallback).
@@ -71,6 +73,7 @@ CREATE TABLE IF NOT EXISTS world_log (
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
   x INTEGER NOT NULL,
   y INTEGER NOT NULL,
+  z INTEGER NOT NULL,
   block_id TEXT NOT NULL,
   at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -83,4 +86,6 @@ VALUES
 ('builtin:grass','Grass Block',NULL,'SYSTEM',0.6,0,'#648b4d','solid',1),
 ('builtin:wood','Wood',NULL,'SYSTEM',2,0,'#9b7045','solid',1),
 ('builtin:glass','Glass',NULL,'SYSTEM',0.3,0,'#8dc6d7','transparent',1),
-('builtin:glowstone','Glowstone',NULL,'SYSTEM',0.3,15,'#f3c76b','glowing',1);
+('builtin:glowstone','Glowstone',NULL,'SYSTEM',0.3,15,'#f3c76b','glowing',1),
+('builtin:leaves','Leaves',NULL,'SYSTEM',0.2,0,'#3f7a34','solid',1),
+('builtin:bedrock','Bedrock',NULL,'SYSTEM',0,0,'#1b1d21','solid',1);

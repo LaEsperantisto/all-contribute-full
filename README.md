@@ -13,20 +13,22 @@ A Minecraft-like, browser-based MMO prototype with player-authored blocks and re
 - Players can inspect active sessions and revoke other devices; logout revokes the current session server-side.
 - Built-in blocks (`builtin:stone`, owner `SYSTEM`) cannot be edited; custom blocks can only be edited by their creator.
 - A block/recipe definition is validated as data, not executed as arbitrary JavaScript. Placement behaviour is declarative (`rules_json`: `support` + `incompatibleWith`); conflicting blocks refuse placement or break, they never crash the game. See `GLOSSARY.md` and `docs/adr/0001-staged-behaviour-model.md`.
-- **Server-authoritative shared world**: base terrain is deterministic (identical in Worker and browser, `backend/src/terrain.ts` mirrored in `frontend/app.js`), only player edits are stored. The browser canvas places/breaks against the API; a WebSocket via the `WorldLive` Durable Object pushes edits to every connected client, with `world_log`-cursor polling as fallback. See `docs/adr/0002-server-world-before-dve.md`.
-- **3D view via Divine Voxel Engine (DVE)**: the "Open 3D" button renders the same server world as a voxel column in a Babylon.js canvas (`@divinevoxel/vlox` + `vlox-babylon`). Voxels are painted **only** from server-echoed edits (the same WebSocket the 2D canvas uses); clicks in the 3D view go through the identical `POST /api/world/place|break` round-trip. If WebGL is unavailable the view shows a plain "3D view unavailable" message and the 2D canvas keeps working. See `frontend/dve/` below.
+- **Server-authoritative shared world**: the world is a 3D voxel volume addressed by `(x, y, z)` (y up from bedrock). Base terrain — height-map over x/z, layered soil columns, caves, trees — is deterministic and byte-identical in Worker and browser (`backend/src/terrain.ts` mirrored in `frontend/dve/src/world.js`); only player edits are stored (sparse). Placing/breaking goes through the API with 3D occupancy and support validation; a WebSocket via the `WorldLive` Durable Object pushes edits to every connected client, with `world_log`-cursor polling as fallback. See `docs/adr/0002-server-world-before-dve.md`.
+- **Fullscreen 3D game via Divine Voxel Engine (DVE)**: opening the site boots straight into a first-person voxel game rendered with Babylon.js (`@divinevoxel/vlox` + `vlox-babylon`) — no landing page, no Play button. WASD movement, mouse look (pointer lock, drag-look fallback), walk/fly modes, a hotbar (1–9), crosshair targeting; **Esc** opens a pause menu hosting settings, inventory, block manager, and account. Every 3D click goes through the identical `POST /api/world/place|break` round-trip in `(x, y, z)`, and voxels are painted **only** from server-echoed edits over the WebSocket. If WebGL is unavailable the loading overlay reports it. See `frontend/dve/` below.
+- **Block manager for authors**: in-game (press **B**) you can create, edit, and delete your own blocks; built-ins are immutable and deletion is refused while a block is placed in the world or referenced by recipes (`DELETE /api/blocks/:id`).
+- **Client settings** (localStorage): sensitivity, FOV, render distance, movement speed, walk/fly, and a server selector — the global production Worker or a local dev Worker (local option only over `http://`).
 - **Server-side inventory**: stacks live in D1 per account; placing debits, breaking credits, crafting is validated and applied server-side. Old browser-local stacks are uploaded once per account automatically.
 
 This is a starter project, not a production MMO. It lacks authoritative movement, chunk streaming, anti-cheat, rate limiting, moderation, and production-grade account recovery.
 
 ## Files
 
-- `frontend/index.html` — page shell
+- `frontend/index.html` — game shell: fullscreen canvas + HUD, dialogs (pause, settings, inventory, block manager, account), no landing page
 - `frontend/styles.css` — styling
-- `frontend/app.js` — frontend: login/register, API calls, block/recipe editors, shared-world canvas + live sync, 3D view wiring
-- `frontend/dve/` — Divine Voxel Engine bundle: `src/` (Babylon + vlox integration: `main.js`, worker scripts, flag driver in `world.worker.js`), `build.mjs` (esbuild bundle), committed pre-built `dist/` (no build step at deploy)
+- `frontend/app.js` — frontend: game boot (imports the DVE view, then creates it), pause menu + settings/server selector, HUD/hotbar, inventory + block-manager dialogs, login/register, API calls, shared-world edit state + live sync, 3D game wiring
+- `frontend/dve/` — Divine Voxel Engine bundle: `src/` (Babylon + vlox integration: `main.js`, `world.js` — the client-side terrain mirror, worker scripts, flag driver in `world.worker.js`), `build.mjs` (esbuild bundle), committed pre-built `dist/` (no build step at deploy)
 - `backend/src/index.ts` — Cloudflare Worker API
-- `backend/src/terrain.ts` — deterministic base terrain (mirrored in the frontend)
+- `backend/src/terrain.ts` — deterministic 3D base terrain (mirrored byte-for-byte in `frontend/dve/src/world.js`; parity is testable by exhaustive diff over the world bounds)
 - `backend/wrangler.jsonc` — Worker/D1/Durable Object configuration
 - `backend/package.json` — backend dependencies/scripts
 - `backend/tsconfig.json` — TypeScript configuration
@@ -68,6 +70,10 @@ The migration chain was rebased: the earlier one-time migrations (session lifeti
 
 The new Durable Object (`WorldLive`) needs no database work: `wrangler deploy` provisions it from `wrangler.jsonc`'s `migrations` entry. If you deploy onto a Worker that previously ran the Cloudflare template's `MyDurableObject`, the stale class blocks new deploys; the clean fix is `npx wrangler delete --name all-contrib` followed by a redeploy (D1 data is a separate resource and survives).
 
+### World model v2 (`0005_world_3d.sql`)
+
+The world moved from a 2D grid to true 3D `(x, y, z)` coordinates. `0005_world_3d.sql` drops and recreates `world_edits`/`world_log` with a `z` column and y-up semantics, and seeds the two new built-in blocks (`builtin:leaves`, `builtin:bedrock`). Old 2D-era edits do not translate to the new coordinate system: **applying 0005 to a deployed database resets the shared world** (accounts, blocks, recipes and inventories are untouched). Accounts that placed blocks before the upgrade keep their inventories but wake up in the new terrain.
+
 ## 2. Deploy the API
 
 The Worker name is configured as `all-contrib`. When updating an existing installation, **keep your existing `wrangler.jsonc` and its real D1 `database_id`**; do not replace it with a copy containing the placeholder ID. Deploy:
@@ -102,12 +108,14 @@ npm install          # once; pulls @divinevoxel/vlox + vlox-babylon + babylonjs
 npm run build        # esbuild → frontend/dve/dist/ (commit the output)
 ```
 
-Known 3D-view limitations:
+Known limitations of the 3D game:
 
-- Block textures are compiled once at view init; publishing a new block while the 3D view is open won't show its texture until the view is re-opened.
-- The world is rendered as a slab: 3D `(x, z)` maps to 2D `(x, 31 - y)` with `z ∈ [0,16)`; only that window is synced from the server (`dveMod.SLAB`).
-- Stock vlox 0.0.72 deadlocks its generation/lighting queues at fixed-radius borders; `frontend/dve/src/world.worker.js` contains a persistent link-and-flag driver (`driveSlabPipeline`) that keeps the deterministic slab pipeline dispatching. Do not "simplify" it without re-testing distant sectors.
-- Under heavy CPU load (e.g. headless Chromium with swiftshader in CI) the mesher→main section deliveries can stall part-way through the initial 720-section build: the centre renders and pixel-proves fine, but far sectors may lag. This is vlox backpressure under starvation, not data loss.
+- Block textures are compiled once when the game view is first created; publishing a new block mid-session paints with a placeholder color until the page is reloaded.
+- The world the client renders is a finite volume: a 96×32×96 voxel region centered on the origin (`SLAB` in `frontend/dve/src/world.js`), enforced client-side (camera clamp + click bounds check). The API is looser — it accepts coordinates with x/z in ±1,000,000 and y in 0..31 (`worldCoords`), so the region is a rendering/authority convention, not a storage limit. The whole rendered region sits inside vlox's fixed generator radius budget, so generation completes around the spawn instead of streaming. Chunk streaming is out of scope (see `docs/adr/0002`).
+- Terrain is byte-identical in `backend/src/terrain.ts` and its mirror `frontend/dve/src/world.js`. Changing it means changing both in lockstep — a desync renders one terrain in the head and edits validated against another (the generator fetches only sparse edits from the API).
+- No collision physics: walk mode snaps the eye to the deterministic procedural surface, fly mode is free flight; blocks placed at body height are clipped through (creative-style).
+- Stock vlox 0.0.72 deadlocks its generation/lighting queues at fixed-radius borders; `frontend/dve/src/world.worker.js` contains a persistent link-and-flag driver (`driveSlabPipeline`) that keeps the deterministic pipeline dispatching. Do not "simplify" it without re-testing distant sectors.
+- Under heavy CPU load (e.g. headless Chromium with swiftshader in CI) the mesher→main section deliveries can stall part-way through the initial build: the centre renders and pixel-proves fine, but far sectors may lag. This is vlox backpressure under starvation, not data loss.
 
 ## 4. CORS
 
@@ -129,7 +137,7 @@ npx wrangler dev                                             # http://127.0.0.1:
 
 On a fresh checkout (or after deleting `.wrangler/state`) the local D1 is empty and every query fails with `no such table` — run the migrations command above once first (stop `wrangler dev` while it runs; two wrangler processes on the same local DB lock each other). `wrangler dev` persists to `.wrangler/state` by default; if you pass `--persist-to`, pass it to the `d1` commands too.
 
-Frontend: serve `frontend/` and point `API_BASE` in `frontend/app.js` at `http://127.0.0.1:8787` for the session (keep the change out of any commit):
+Frontend: serve `frontend/`; the page boots straight into the game — press **Esc** and pick the local Worker in **Settings → Server → Local dev** (the option only appears on `http://` pages — no code edit, it persists in localStorage):
 
 ```bash
 cd frontend
@@ -150,15 +158,16 @@ Visit `http://localhost:8000`. The Worker allows the `http://localhost:8000` ori
 - `GET /api/blocks`
 - `POST /api/blocks` (HttpOnly session cookie; creates a custom block)
 - `PUT /api/blocks/:id` (creator only)
+- `DELETE /api/blocks/:id` (creator only; refuses built-ins, unknown IDs, and blocks still placed in the world or referenced by recipes)
 - `GET /api/recipes`
 - `POST /api/recipes` (HttpOnly session cookie; creates recipe)
 - `POST /api/recipes/craft` (session; validates ingredients and result server-side, one batch)
 - `GET /api/inventory` (session)
 - `POST /api/inventory/add` / `POST /api/inventory/remove` / `POST /api/inventory/clear` (session; testing/grant tools)
-- `GET /api/world?x0&y0&x1&y1&since` (public read: edits in a ≤4096-cell window + log entries after a cursor)
-- `POST /api/world/place` (session; debits inventory, refuses on `occupied`/`no_support`/`incompatible`/`no_item` — a refusal debits nothing)
-- `POST /api/world/break` (session; credits the dropped block, refuses when the cell is empty or the stack is at 999)
-- `WS /api/world/live` (Durable Object fan-out; sends `{"type":"edit","x","y","block_id"}` to every connected client)
+- `GET /api/world?x0&y0&z0&x1&y1&z1&since` (public read: sparse edits in a voxel volume — max 20,000 rows — plus `world_log` entries after a cursor)
+- `POST /api/world/place` `{x, y, z, item_id}` (session; debits inventory, refuses on `occupied`/`no_support`/`incompatible`/`no_item` — a refusal debits nothing; the block's support rule is evaluated against the voxel beneath, and `incompatibleWith` scans the six neighbours)
+- `POST /api/world/break` `{x, y, z}` (session; credits the dropped block, refuses empty voxels, unbreakable blocks such as bedrock (`code:"unbreakable"`), and a stack at 999)
+- `WS /api/world/live` (Durable Object fan-out; sends `{"type":"edit","x","y","z","block_id"}` to every connected client)
 
 ## Security notes before public launch
 
