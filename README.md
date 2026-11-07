@@ -108,6 +108,8 @@ npm install          # once; pulls @divinevoxel/vlox + vlox-babylon + babylonjs
 npm run build        # esbuild → frontend/dve/dist/ (commit the output)
 ```
 
+`npm run build` also writes `dve/src/rev.js` — content hashes of every bundle — and both `app.js` and the view import/bundle their scripts as `?h=<hash>`. Without that, GitHub Pages' caching pins whatever `dve-view.js` a browser first fetched, and a stale bundle throws at calls only newer app.js makes (e.g. `grabPointer is not a function`). Run the build **twice** after changing sources: the first pass seeds the manifest the second pass inlines. Bump `?v=` on `app.js`/`styles.css` in `index.html` when app.js changes.
+
 Known limitations of the 3D game:
 
 - Block textures are compiled once when the game view is first created; publishing a new block mid-session paints with a placeholder color until the page is reloaded.
