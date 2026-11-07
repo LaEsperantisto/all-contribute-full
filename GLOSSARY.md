@@ -13,7 +13,15 @@ Vocabulary for All Contribute. No implementation details here.
 - **Placement outcome** — the three results of a placement attempt: placed, refused (block returned to the player), or transformed by the block beneath (player-controlled via behaviour).
 - **Conflict** — two active block behaviours demanding contradictory world changes (e.g. one shoves neighbours right, another shoves them left). The game must never crash; the blocks involved break instead. Reaches full meaning with executable behaviour (ADR 0001).
 - **Recipe** — ingredients consume item stacks and create a result item; authored in-game like blocks.
-- **Entity / mob** (phased) — a player-authored creature, registered like a block and governed by the same namespace policies.
+- **Item** — what a player holds, carries, and consumes: the unit of the held-thing registry, distinct from a block (what occupies a voxel). Every block has an item that places it; tools, weapons, food, and materials are items with no voxel form.
+- **Item kind** — what an item is for: placeable (`block`), mining aid (`tool`), attack (`weapon`), eaten (`food`), or crafting input only (`material`). Stats belong to the kind: speed, damage, healing, durability.
+- **Programme** — the one declarative act a placeable item performs: the block it puts into the world. Authored by the item's creator as data; there is no executable behaviour yet (ADR 0001).
+- **Built-in item** — an item owned by SYSTEM under the `builtin:` namespace. Immutable for everyone.
+- **Player item** — an item under the `player:<username>:<ns>:<id>` namespace. Only its creator can change it.
+- **Appearance** — the four colours an account owns for its avatar: head, body, legs and eyes. Stored per user, relayed on presence frames, and re-coloured live. Eyes are drawn on the head, so they are the only part that says which way a body is facing.
+- **Entity / mob** — a creature the world object simulates: it walks on the surface, and is either hostile (seeks the nearest living player within a 40-block sphere, damages them when the 3D gap closes to 1.8 blocks) or peaceful (wanders). Range is measured in all three axes, so altitude is protection; only the mob's *steering* is horizontal. Hostility is a property of the creature, not of the player.
+- **Health** — a player's 0–20 life total, owned by the server. Zero means dead: no movement, no damage, and the only way back is respawn.
+- **Respawn** — returning a dead player to the surface spawn with full health.
 
 ## World
 
