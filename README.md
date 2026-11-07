@@ -118,7 +118,8 @@ Known limitations of the 3D game:
 - Walking physics is client-side presentation: gravity, Space-jump, and voxel AABB collision run in `main.js` against the client's authoritative cell mirror (synced `worldEdits` + the `terrain.ts` mirror). The server validates block edits, never the player's body. No step-up (a one-block ledge needs a jump), no fall damage; blocks pushed into the player by other players' edits only pop them up if the block rises into their feet.
 - Stock vlox 0.0.72 deadlocks its generation/lighting queues at fixed-radius borders and wedges its Builder `paint-voxel` task (`LockSectors` awaits sectors checked out for mesher transfer forever; the world thread's voxel palette lands at an offset); `frontend/dve/src/world.worker.js` carries the compensations — the `driveSlabPipeline` link-and-flag maintenance driver, `shiftLUTToPalette` LUT re-alignment, and a `paint-direct` simulation-brush task used by `applyEdit`. Do not "simplify" any of them without re-testing distant sectors and click-breaking placed blocks.
 - Under heavy CPU load (e.g. headless Chromium with swiftshader in CI) the mesher→main section deliveries can stall part-way through the initial build: the centre renders and pixel-proves fine, but far sectors may lag. This is vlox backpressure under starvation, not data loss.
-- Presence avatars are presentation frames on the world WS (`pose` ~4 Hz, `who` roster pull, 60 s staleness sweep). A hidden browser tab halts rAF, so a backgrounded player's avatar freezes in everyone else's view — cosmetic, and it self-heals when the tab is focused again.
+- Presence avatars are presentation frames on the world WS (`pose` ~4 Hz carrying the saved appearance colours, `who` roster pull, 60 s staleness sweep). A hidden browser tab halts rAF, so a backgrounded player's avatar freezes in everyone else's view — cosmetic, and it self-heals when the tab is focused again. The DO sanitizes `appearance` down to the three `#rrggbb` colour keys; presence remains presentation-only and is never validated like a block edit.
+- Every Babylon mesh this app adds (avatar parts, name cards, glow cubes) must set `renderingGroupId = 1`. vlox draws its voxel sections in group 1, and Babylon clears the depth buffer between rendering groups — a group-0 mesh is painted over by voxels that are *behind* it, which looks like players showing through walls. Keep new meshes in `VOXEL_GROUP` (`frontend/dve/src/main.js`).
 - The day/night cycle is a shared epoch clock (`Date.now() % 24 min`): every client picks the same phase without sync, but the phase follows wall-clock UTC, not any server-side game calendar.
 - Glowing blocks (registry `light > 0`) glow via a Babylon GlowLayer emissive cube per cell; the vlox light pipeline remains disabled, so glow is a render overlay, not propagated lighting.
 
@@ -142,7 +143,7 @@ npx wrangler dev                                             # http://127.0.0.1:
 
 On a fresh checkout (or after deleting `.wrangler/state`) the local D1 is empty and every query fails with `no such table` — run the migrations command above once first (stop `wrangler dev` while it runs; two wrangler processes on the same local DB lock each other). `wrangler dev` persists to `.wrangler/state` by default; if you pass `--persist-to`, pass it to the `d1` commands too.
 
-Frontend: serve `frontend/`; the page boots straight into the game — press **Esc** and pick the local Worker in **Settings → Server → Local dev** (the option only appears on `http://` pages — no code edit, it persists in localStorage):
+Frontend: serve `frontend/`; the page opens the main menu — **Join** starts the game. In-game keys: **WASD**/**Space** move and jump, mouse look (pointer lock, "Grab cursor" HUD button re-grabs it), left/right click place/break, **1–9** hotbar, **E** character, **I** inventory, **B** block manager, **Esc** pause (Esc while the pointer is locked exits the lock and opens the pause menu in the same press). Pick the local Worker in **Menu → Settings → Server → Local dev** (the option only appears on `http://` pages — no code edit, it persists in localStorage):
 
 ```bash
 cd frontend
@@ -163,16 +164,19 @@ Visit `http://localhost:8000`. The Worker allows the `http://localhost:8000` ori
 - `GET /api/blocks`
 - `POST /api/blocks` (HttpOnly session cookie; creates a custom block)
 - `PUT /api/blocks/:id` (creator only)
-- `DELETE /api/blocks/:id` (creator only; refuses built-ins, unknown IDs, and blocks still placed in the world or referenced by recipes)
-- `GET /api/recipes`
+- `DELETE /api/blocks/:id` (creator only; refuses built-ins and unknown IDs. Deleting cascades: every `world_edits` cell holding that block is cleared and broadcast as air, recipes that reference it are removed, and inventory stacks of it are dropped.)
+- `GET /api/recipes` (includes `creator` so the owner can manage their own list)
 - `POST /api/recipes` (HttpOnly session cookie; creates recipe)
+- `PUT /api/recipes/:id` / `DELETE /api/recipes/:id` (creator only; PUT re-validates with the same rules as POST and keeps the existing name if `name` is omitted)
 - `POST /api/recipes/craft` (session; validates ingredients and result server-side, one batch)
 - `GET /api/inventory` (session)
-- `POST /api/inventory/add` / `POST /api/inventory/remove` / `POST /api/inventory/clear` (session; testing/grant tools)
+- `POST /api/inventory/add` / `POST /api/inventory/remove` / `POST /api/inventory/clear` (session; grant tools — the frontend only shows the "Add test items" form to the `admin` account)
 - `GET /api/world?x0&y0&z0&x1&y1&z1&since` (public read: sparse edits in a voxel volume — max 20,000 rows — plus `world_log` entries after a cursor)
 - `POST /api/world/place` `{x, y, z, item_id}` (session; debits inventory, refuses on `occupied`/`no_support`/`incompatible`/`no_item` — a refusal debits nothing; the block's support rule is evaluated against the voxel beneath, and `incompatibleWith` scans the six neighbours)
 - `POST /api/world/break` `{x, y, z}` (session; credits the dropped block, refuses empty voxels, unbreakable blocks such as bedrock (`code:"unbreakable"`), and a stack at 999)
-- `WS /api/world/live` (Durable Object fan-out; sends `{"type":"edit","x","y","z","block_id"}` to every connected client)
+- `GET /api/player/state` (session; saved spawn/look plus the saved `appearance` colours) / `POST /api/player/state` (session; persists position, yaw and pitch)
+- `POST /api/player/appearance` (session; `{body_colour, head_colour, accent_colour}` as `#rrggbb`, upserted into `player_appearance`)
+- `WS /api/world/live` (Durable Object fan-out; sends `{"type":"edit","x","y","z","block_id"}` to every connected client, and presence frames — a client posts `{"type":"pose",name,x,y,z,yaw,appearance}`, the object relays it plus a `roster` on `who` and a `leave` on disconnect; appearance colours are whitelisted server-side)
 
 ## Security notes before public launch
 

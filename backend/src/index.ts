@@ -24,6 +24,21 @@ const ABSOLUTE_TIMEOUT_MS = 30 * DAY_MS;
 // Touch at most once every 15 minutes to avoid a D1 write on every API request.
 const SESSION_TOUCH_INTERVAL_MS = 15 * 60 * 1000;
 
+// Character appearance colours, whitelisted and pattern-checked before they
+// touch any presence frame — the DO never relays arbitrary client payload.
+type Appearance = Partial<Record<"body_colour" | "head_colour" | "accent_colour", string>>;
+
+function sanitizeAppearance(raw: unknown): Appearance | undefined {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const value = raw as Record<string, unknown>;
+  const out: Appearance = {};
+  for (const key of ["body_colour", "head_colour", "accent_colour"] as const) {
+    const colour = value[key];
+    if (typeof colour === "string" && /^#[0-9a-f]{6}$/i.test(colour)) out[key] = colour;
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+
 // Live fan-out for the shared world: keeps connected players' WebSockets and
 // broadcasts each world edit. No hibernation (free tier): sockets live in
 // memory; clients reconnect after eviction and the sequence-numbered polling
@@ -33,7 +48,7 @@ export class WorldLive extends DurableObject<Env> {
   sockets: WebSocket[] = [];
   // Presence: socket -> current pose, so joining players see a roster and
   // everyone gets periodic pose fan-out (~5 Hz, client-throttled).
-  presence: Map<WebSocket, { name: string; x: number; y: number; z: number; yaw: number }> = new Map();
+  presence: Map<WebSocket, { name: string; x: number; y: number; z: number; yaw: number; appearance?: Appearance }> = new Map();
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
@@ -81,7 +96,11 @@ export class WorldLive extends DurableObject<Env> {
     } else if (msg.type === "pose") {
       const num = (v: unknown, fallback = 0) => (typeof v === "number" && Number.isFinite(v) ? v : fallback);
       const name = String(msg.name || "").slice(0, 32) || this.nameOf(socket) || "someone";
-      const entry = { name, x: num(msg.x), y: num(msg.y), z: num(msg.z), yaw: num(msg.yaw) };
+      const appearance = sanitizeAppearance(msg.appearance);
+      const entry = {
+        name, x: num(msg.x), y: num(msg.y), z: num(msg.z), yaw: num(msg.yaw),
+        ...(appearance ? { appearance } : {})
+      };
       this.presence.set(socket, entry);
       this.sendOthers(socket, { type: "pose", ...entry });
     }
@@ -396,6 +415,22 @@ async function listRecipes(env: Env): Promise<unknown[]> {
   return results.map(row => ({ ...row, ingredients: JSON.parse(row.ingredients_json) }));
 }
 
+// Shared recipe body validation: POST and PUT must agree on exactly the same
+// rules, so the checks live here once. Returns null for any invalid input.
+function recipeFieldsFromInput(data: unknown): { name: string; ingredients: string[]; result_id: string; quantity: number } | null {
+  const value = (data && typeof data === "object" ? data : {}) as Record<string, unknown>;
+  const name = String(value.name ?? "").trim();
+  const ingredients: string[] = Array.isArray(value.ingredients) ? value.ingredients.map((entry: unknown) => String(entry)) : [];
+  const resultId = String(value.result_id ?? "").trim();
+  const quantity = Number(value.quantity);
+  if (name.length < 1 || name.length > 60 || ingredients.length < 1 || ingredients.length > 9 ||
+      ingredients.some(entry => !validItemId(entry)) || !validItemId(resultId) ||
+      !Number.isInteger(quantity) || quantity < 1 || quantity > 999) {
+    return null;
+  }
+  return { name, ingredients, result_id: resultId, quantity };
+}
+
 type StackRow = { quantity: number };
 type RecipeRow = { id: string; name: string; ingredients_json: string; result_id: string; quantity: number };
 type LogRow = { seq: number; x: number; y: number; z: number; block_id: string };
@@ -486,14 +521,25 @@ async function handleBreak(request: Request, env: Env, origin: string | null): P
 
 // ---- player state: server-persisted position + look -------------------------
 
+type AppearanceColours = { body_colour: string; head_colour: string; accent_colour: string };
+
+// Used when a player has never saved an appearance.
+const DEFAULT_APPEARANCE: AppearanceColours = { body_colour: "#3b6ea5", head_colour: "#d9a06b", accent_colour: "#2f8f4f" };
+
 async function handleGetPlayerState(request: Request, env: Env, origin: string | null): Promise<Response> {
   const auth = await authenticate(request, env);
   if (!auth) return err("Log in first.", 401, origin);
-  const row = await env.DB
-    .prepare("SELECT x, y, z, yaw, pitch FROM player_state WHERE user_id=?")
-    .bind(auth.user.id)
-    .first<{ x: number; y: number; z: number; yaw: number; pitch: number }>();
-  return json({ state: row ?? null }, 200, origin);
+  const [row, appearance] = await Promise.all([
+    env.DB
+      .prepare("SELECT x, y, z, yaw, pitch FROM player_state WHERE user_id=?")
+      .bind(auth.user.id)
+      .first<{ x: number; y: number; z: number; yaw: number; pitch: number }>(),
+    env.DB
+      .prepare("SELECT body_colour, head_colour, accent_colour FROM player_appearance WHERE user_id=?")
+      .bind(auth.user.id)
+      .first<AppearanceColours>()
+  ]);
+  return json({ state: row ?? null, appearance: appearance ?? DEFAULT_APPEARANCE }, 200, origin);
 }
 
 async function handlePutPlayerState(request: Request, env: Env, origin: string | null): Promise<Response> {
@@ -510,6 +556,25 @@ async function handlePutPlayerState(request: Request, env: Env, origin: string |
     "INSERT INTO player_state(user_id,x,y,z,yaw,pitch) VALUES(?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET x=excluded.x, y=excluded.y, z=excluded.z, yaw=excluded.yaw, pitch=excluded.pitch, updated_at=CURRENT_TIMESTAMP"
   ).bind(auth.user.id, x, y, z, yaw, pitch).run();
   return json({ ok: true }, 200, origin);
+}
+
+// Character appearance: one upserted row per user; colours join the live
+// presence frames so other players render your avatar in your colours.
+async function handlePostPlayerAppearance(request: Request, env: Env, origin: string | null): Promise<Response> {
+  const auth = await authenticate(request, env);
+  if (!auth) return err("Log in first.", 401, origin);
+  const data = await body<{ body_colour: unknown; head_colour: unknown; accent_colour: unknown }>(request);
+  const appearance: AppearanceColours = {
+    body_colour: String(data.body_colour ?? ""),
+    head_colour: String(data.head_colour ?? ""),
+    accent_colour: String(data.accent_colour ?? "")
+  };
+  if (!validColour(appearance.body_colour) || !validColour(appearance.head_colour) || !validColour(appearance.accent_colour))
+    return err("Invalid appearance colours.", 400, origin);
+  await env.DB.prepare(
+    "INSERT INTO player_appearance(user_id,body_colour,head_colour,accent_colour) VALUES(?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET body_colour=excluded.body_colour, head_colour=excluded.head_colour, accent_colour=excluded.accent_colour, updated_at=CURRENT_TIMESTAMP"
+  ).bind(auth.user.id, appearance.body_colour, appearance.head_colour, appearance.accent_colour).run();
+  return json(appearance, 200, origin);
 }
 
 async function handleCraft(request: Request, env: Env, origin: string | null): Promise<Response> {
@@ -773,21 +838,42 @@ export default {
       if (path === "/api/recipes" && request.method === "POST") {
         const auth = await authenticate(request, env);
         if (!auth) return err("Log in first.", 401, origin);
-        const data = await body<any>(request);
-        const name = String(data.name || "").trim();
-        const ingredients: string[] = Array.isArray(data.ingredients) ? data.ingredients.map((value: unknown) => String(value)) : [];
-        const resultId = String(data.result_id || "").trim();
-        const quantity = Number(data.quantity);
-        if (name.length < 1 || name.length > 60 || ingredients.length < 1 || ingredients.length > 9 ||
-            ingredients.some(value => !validItemId(value)) || !validItemId(resultId) ||
-            !Number.isInteger(quantity) || quantity < 1 || quantity > 999) {
-          return err("Invalid recipe fields.", 400, origin);
-        }
+        const data = await body<unknown>(request);
+        const fields = recipeFieldsFromInput(data);
+        if (!fields) return err("Invalid recipe fields.", 400, origin);
         const id = crypto.randomUUID();
         await env.DB.prepare(
           "INSERT INTO recipes(id,name,creator_id,creator_name,ingredients_json,result_id,quantity) VALUES(?,?,?,?,?,?,?)"
-        ).bind(id, name, auth.user.id, auth.user.username, JSON.stringify(ingredients), resultId, quantity).run();
+        ).bind(id, fields.name, auth.user.id, auth.user.username, JSON.stringify(fields.ingredients), fields.result_id, fields.quantity).run();
         return json({ ok: true, id }, 201, origin);
+      }
+
+      const recipeMatch = path.match(/^\/api\/recipes\/([0-9a-f-]{36})$/i);
+      if (recipeMatch && request.method === "PUT") {
+        const auth = await authenticate(request, env);
+        if (!auth) return err("Log in first.", 401, origin);
+        const id = recipeMatch[1];
+        const existing = await env.DB.prepare("SELECT creator_id,name FROM recipes WHERE id=?").bind(id).first<{ creator_id: string; name: string }>();
+        if (!existing) return err("Recipe not found.", 404, origin);
+        if (existing.creator_id !== auth.user.id) return err("Only the creator can edit this recipe.", 403, origin);
+        const data = await body<{ name?: unknown; ingredients?: unknown; result_id?: unknown; quantity?: unknown }>(request);
+        // `name` is optional on edit: omitting it keeps the recipe's current name.
+        const fields = recipeFieldsFromInput({ ...data, name: data.name === undefined ? existing.name : data.name });
+        if (!fields) return err("Invalid recipe fields.", 400, origin);
+        await env.DB.prepare("UPDATE recipes SET name=?,ingredients_json=?,result_id=?,quantity=? WHERE id=?")
+          .bind(fields.name, JSON.stringify(fields.ingredients), fields.result_id, fields.quantity, id).run();
+        return json({ ok: true }, 200, origin);
+      }
+
+      if (recipeMatch && request.method === "DELETE") {
+        const auth = await authenticate(request, env);
+        if (!auth) return err("Log in first.", 401, origin);
+        const id = recipeMatch[1];
+        const existing = await env.DB.prepare("SELECT creator_id FROM recipes WHERE id=?").bind(id).first<{ creator_id: string }>();
+        if (!existing) return err("Recipe not found.", 404, origin);
+        if (existing.creator_id !== auth.user.id) return err("Only the creator can delete this recipe.", 403, origin);
+        await env.DB.prepare("DELETE FROM recipes WHERE id=?").bind(id).run();
+        return json({ ok: true }, 200, origin);
       }
 
       // ---- Shared world --------------------------------------------------------
@@ -822,6 +908,7 @@ export default {
       if (path === "/api/world/break" && request.method === "POST") return handleBreak(request, env, origin);
       if (path === "/api/player/state" && request.method === "GET") return handleGetPlayerState(request, env, origin);
       if (path === "/api/player/state" && request.method === "POST") return handlePutPlayerState(request, env, origin);
+      if (path === "/api/player/appearance" && request.method === "POST") return handlePostPlayerAppearance(request, env, origin);
 
       // ---- Inventory ------------------------------------------------------------
       if (path === "/api/inventory" && request.method === "GET") {
