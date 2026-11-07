@@ -1,0 +1,10 @@
+
+## Amendment — menu-first boot, presence, namespaces, day/night, cascade delete (2026-11-07)
+
+**Boot is the main menu; the game view is lazy and stays live.** `Join global server` imports the DVE bundle, fetches registry + edits, and creates the view; the player's last pose is restored from `player_state` (persisted every 2 s while moving). `Main menu` from the pause dialog hides the game but keeps the engine and socket alive — rejoining skips re-init and just re-grabs the cursor. Cursor hand-off is explicit (HUD "Grab cursor" button; any closed dialog that leaves no dialog open re-grabs).
+
+**Player blocks are `player:USERNAME:NAMESPACE:BLOCKNAME`** (four segments, exactly like `builtin:` ids); the display name is the separate `name` column. `POST /api/blocks` takes a `namespace` (optional, default `default` for old cached clients); migration 0007 rewrote existing 3-segment ids. **`DELETE /api/blocks/:id` cascades**: placed copies are removed from `world_edits` (terrain restored, broadcast as `air` over the WS), referencing recipes are dropped, inventory stacks are purged — deleting one's test block never requires manual world cleanup.
+
+**Presence rides the existing `/api/world/live` WorldLive object:** clients post a `pose` frame (~4 Hz) with their username; the object keeps a socket→pose map and fans `pose`/`leave` out to the other sockets (a `who` frame pulls the roster). Avatars (blocky body + name card, lerped) are rendered client-side from these frames — presentation only, still no server physics, and a hidden tab's rAF halt freezes its render loop (avatars hold position until the tab is visible).
+
+**Day/night is a deterministic epoch clock** — `Date.now() % 24 min` drives sky colour and an image-processing brightness scale; no sync traffic. **Glowing blocks** (registry `light > 0`) render through a Babylon GlowLayer emissive cube on the cell, not the vlox light pipeline (which stays off; faces would multiply by empty light data). **Generator workers keep every server edit including `air`** and receive live `note-edit` relays, so blocks mined before joining — or in cells that activate late — never render solid.

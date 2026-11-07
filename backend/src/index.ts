@@ -31,6 +31,9 @@ const SESSION_TOUCH_INTERVAL_MS = 15 * 60 * 1000;
 // leaves a client permanently stale.
 export class WorldLive extends DurableObject<Env> {
   sockets: WebSocket[] = [];
+  // Presence: socket -> current pose, so joining players see a roster and
+  // everyone gets periodic pose fan-out (~5 Hz, client-throttled).
+  presence: Map<WebSocket, { name: string; x: number; y: number; z: number; yaw: number }> = new Map();
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
@@ -46,14 +49,54 @@ export class WorldLive extends DurableObject<Env> {
       const [client, server] = Object.values(pair);
       server.accept();
       this.sockets.push(server);
+      server.addEventListener("message", (event) => this.onMessage(server, event.data));
       server.addEventListener("close", () => {
         this.sockets = this.sockets.filter((socket) => socket !== server);
+        const name = this.nameOf(server);
+        if (this.presence.delete(server) && name) {
+          this.sendOthers(server, { type: "leave", name });
+        }
       });
-      server.send(JSON.stringify({ type: "hello" }));
+      server.send(JSON.stringify({
+        type: "roster",
+        players: [...this.presence.values()],
+      }));
       return new Response(null, { status: 101, webSocket: client });
     }
 
     return new Response("Expected a WebSocket upgrade.", { status: 426 });
+  }
+
+  private nameOf(socket: WebSocket): string {
+    return this.presence.get(socket)?.name || "";
+  }
+
+  private onMessage(socket: WebSocket, data: string | ArrayBuffer): void {
+    if (typeof data !== "string") return;
+    let msg: any;
+    try { msg = JSON.parse(data); } catch { return; }
+    if (!msg || typeof msg !== "object") return;
+    if (msg.type === "who") {
+      socket.send(JSON.stringify({ type: "roster", players: [...this.presence.values()] }));
+    } else if (msg.type === "pose") {
+      const num = (v: unknown, fallback = 0) => (typeof v === "number" && Number.isFinite(v) ? v : fallback);
+      const name = String(msg.name || "").slice(0, 32) || this.nameOf(socket) || "someone";
+      const entry = { name, x: num(msg.x), y: num(msg.y), z: num(msg.z), yaw: num(msg.yaw) };
+      this.presence.set(socket, entry);
+      this.sendOthers(socket, { type: "pose", ...entry });
+    }
+  }
+
+  private sendOthers(from: WebSocket, message: unknown): void {
+    const data = JSON.stringify(message);
+    for (const socket of this.sockets) {
+      if (socket === from) continue;
+      try {
+        socket.send(data);
+      } catch {
+        // Pruned by the close listener.
+      }
+    }
   }
 
   broadcast(message: unknown): void {
@@ -245,7 +288,7 @@ function validColour(value: string): boolean {
 const behaviours = new Set(["solid", "transparent", "glowing", "decorative"]);
 
 const validItemId = (value: string): boolean =>
-  validId(value) || /^player:[a-z0-9_]+:[a-z0-9_]+$/.test(value);
+  validId(value) || /^player:[a-z0-9_]+:[a-z0-9_]+:[a-z0-9_]+$/.test(value);
 
 // Placement semantics (ADR 0001): declarative rules only for now; executable
 // player behaviour versions alongside these later. Malformed rules NEVER throw:
@@ -441,6 +484,34 @@ async function handleBreak(request: Request, env: Env, origin: string | null): P
   return json({ ok: true, x, y, z, dropped: current }, 200, origin);
 }
 
+// ---- player state: server-persisted position + look -------------------------
+
+async function handleGetPlayerState(request: Request, env: Env, origin: string | null): Promise<Response> {
+  const auth = await authenticate(request, env);
+  if (!auth) return err("Log in first.", 401, origin);
+  const row = await env.DB
+    .prepare("SELECT x, y, z, yaw, pitch FROM player_state WHERE user_id=?")
+    .bind(auth.user.id)
+    .first<{ x: number; y: number; z: number; yaw: number; pitch: number }>();
+  return json({ state: row ?? null }, 200, origin);
+}
+
+async function handlePutPlayerState(request: Request, env: Env, origin: string | null): Promise<Response> {
+  const auth = await authenticate(request, env);
+  if (!auth) return err("Log in first.", 401, origin);
+  const data = await body<{ x: unknown; y: unknown; z: unknown; yaw: unknown; pitch: unknown }>(request);
+  const n = (v: unknown): number | null => (typeof v === "number" && Number.isFinite(v) ? v : null);
+  const x = n(data.x), y = n(data.y), z = n(data.z), yaw = n(data.yaw), pitch = n(data.pitch);
+  if (x === null || y === null || z === null || yaw === null || pitch === null)
+    return err("x, y, z, yaw and pitch must be finite numbers.", 400, origin);
+  if (Math.abs(x) > 1e6 || Math.abs(z) > 1e6 || y < 0 || y > 256)
+    return err("Position is outside the world.", 400, origin);
+  await env.DB.prepare(
+    "INSERT INTO player_state(user_id,x,y,z,yaw,pitch) VALUES(?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET x=excluded.x, y=excluded.y, z=excluded.z, yaw=excluded.yaw, pitch=excluded.pitch, updated_at=CURRENT_TIMESTAMP"
+  ).bind(auth.user.id, x, y, z, yaw, pitch).run();
+  return json({ ok: true }, 200, origin);
+}
+
 async function handleCraft(request: Request, env: Env, origin: string | null): Promise<Response> {
   const auth = await authenticate(request, env);
   if (!auth) return err("Log in first.", 401, origin);
@@ -605,18 +676,23 @@ export default {
         const data = await body<any>(request);
         const name = String(data.name || "").trim();
         const id = String(data.id || "").trim();
+        // Optional for old cached frontends; defaults to "default".
+        const namespace = String(data.namespace || "default").trim();
         const hardness = Number(data.hardness);
         const light = Number(data.light);
         const colour = String(data.colour || "");
         const behaviour = String(data.behaviour || "solid");
         if (name.length < 1 || name.length > 40) return err("Block name must be 1–40 characters.", 400, origin);
-        if (!validId(id) || id.includes(":")) return err("Use a simple ID (letters, numbers and underscores).", 400, origin);
+        if (!/^[A-Za-z0-9_]{1,24}$/.test(namespace)) return err("Namespace must be 1–24 characters (letters, numbers, underscores).", 400, origin);
+        if (!/^[A-Za-z0-9_]{1,24}$/.test(id)) return err("Use a simple ID (letters, numbers and underscores).", 400, origin);
         if (!Number.isFinite(hardness) || hardness < 0 || hardness > 1000) return err("Hardness must be 0–1000.", 400, origin);
         if (!Number.isInteger(light) || light < 0 || light > 15) return err("Light must be an integer from 0 to 15.", 400, origin);
         if (!validColour(colour) || !behaviours.has(behaviour)) return err("Invalid colour or behaviour.", 400, origin);
         const { rules, error: rulesError } = rulesFromInput(data.rules);
         if (rulesError) return err(`Invalid placement rules: ${rulesError}`, 400, origin);
-        const fullId = `player:${auth.user.username.toLowerCase()}:${id}`;
+        // Registry ID: player:USERNAME:NAMESPACE:BLOCKNAME — the display name
+        // (name) is separate, exactly like builtins (builtin:grass / "Grass").
+        const fullId = `player:${auth.user.username.toLowerCase()}:${namespace.toLowerCase()}:${id.toLowerCase()}`;
         try {
           await env.DB.prepare(
             "INSERT INTO blocks(id,name,creator_id,creator_name,hardness,light,colour,behaviour,rules_json,is_builtin) VALUES(?,?,?,?,?,?,?,?,?,0)"
@@ -666,19 +742,28 @@ export default {
         if (!existing) return err("Block not found.", 404, origin);
         if (existing.is_builtin) return err("Built-in blocks are immutable.", 403, origin);
         if (existing.creator_id !== auth.user.id) return err("Only the creator can delete this block.", 403, origin);
-        const refs = await env.DB.prepare(
-          "SELECT (SELECT COUNT(*) FROM recipes WHERE result_id=? OR ingredients_json LIKE ?) AS recipe_refs, (SELECT COUNT(*) FROM world_edits WHERE block_id=?) AS placed"
-        ).bind(id, `%"${id}"%`, id).first<{ recipe_refs: number; placed: number }>();
-        if (refs && (refs.recipe_refs > 0 || refs.placed > 0)) {
-          const parts: string[] = [];
-          if (refs.placed > 0) parts.push(`${refs.placed} placed block(s)`);
-          if (refs.recipe_refs > 0) parts.push(`${refs.recipe_refs} recipe(s)`);
-          return err(`Block is still in use: ${parts.join(" and ")}. Clear those first.`, 409, origin);
+        // Deleting a block cascades: its placed copies are restored to terrain
+        // and referencing recipes are dropped, so "delete my test block" always
+        // works without manual world cleanup first.
+        const placed = await env.DB.prepare(
+          "SELECT x,y,z FROM world_edits WHERE block_id=?"
+        ).bind(id).all<{ x: number; y: number; z: number }>();
+        const recipes = await env.DB.prepare(
+          "SELECT ingredients_json FROM recipes WHERE result_id=? OR ingredients_json LIKE ?"
+        ).bind(id, `%"${id}"%`).all<{ ingredients_json: string }>();
+        await env.DB.prepare("DELETE FROM world_edits WHERE block_id=?").bind(id).run();
+        await env.DB.prepare("DELETE FROM recipes WHERE result_id=? OR ingredients_json LIKE ?")
+          .bind(id, `%"${id}"%`).run();
+        for (const cell of placed.results) {
+          await publishEdit(env, cell.x, cell.y, cell.z, "air");
         }
         await env.DB.prepare("DELETE FROM blocks WHERE id=?").bind(id).run();
         // Stale inventory stacks for a block that no longer exists are dead weight.
         await env.DB.prepare("DELETE FROM inventories WHERE item_id=?").bind(id).run();
-        return json({ ok: true }, 200, origin);
+        return json({
+          ok: true,
+          cleared: { placed: placed.results.length, recipes: recipes.results.length },
+        }, 200, origin);
       }
 
       if (path === "/api/recipes" && request.method === "GET") {
@@ -735,6 +820,8 @@ export default {
 
       if (path === "/api/world/place" && request.method === "POST") return handlePlace(request, env, origin);
       if (path === "/api/world/break" && request.method === "POST") return handleBreak(request, env, origin);
+      if (path === "/api/player/state" && request.method === "GET") return handleGetPlayerState(request, env, origin);
+      if (path === "/api/player/state" && request.method === "POST") return handlePutPlayerState(request, env, origin);
 
       // ---- Inventory ------------------------------------------------------------
       if (path === "/api/inventory" && request.method === "GET") {

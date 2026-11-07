@@ -78,6 +78,17 @@ CREATE TABLE IF NOT EXISTS world_log (
   at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Server-persisted player state: position + look, restored on rejoin.
+CREATE TABLE IF NOT EXISTS player_state (
+  user_id TEXT PRIMARY KEY REFERENCES users(id),
+  x REAL NOT NULL,
+  y REAL NOT NULL,
+  z REAL NOT NULL,
+  yaw REAL NOT NULL DEFAULT 0,
+  pitch REAL NOT NULL DEFAULT 0,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 INSERT OR IGNORE INTO blocks
 (id,name,creator_id,creator_name,hardness,light,colour,behaviour,is_builtin)
 VALUES
