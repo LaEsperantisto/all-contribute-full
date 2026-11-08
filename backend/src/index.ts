@@ -61,11 +61,15 @@ const HEALTH_RECHECK_MS = 2000;
 
 const MAX_MOBS = 12;
 const MOB_TICK_MS = 250;
-// Pose frames arrive four times a second; an entry that has gone quiet for
-// this long has a dead socket behind it (no close event came), so the sweep
-// in sweepStale removes it. 15 s is ~60 missed heartbeats: a backgrounded
-// tab (throttled to ~1 Hz) is never at risk.
-const PRESENCE_STALE_MS = 15_000;
+// Pose frames arrive four times a second from a visible tab. A hidden or
+// backgrounded tab is not: Chrome's intensive throttling reduces its timers
+// to roughly one wake-up a minute, so the window must sit past that — a real
+// (if idle) player must never be evicted, or the sweep itself becomes the
+// disconnect storm. Killed clients in production report close and are
+// removed instantly by the close handler; this sweep is the backstop for
+// connections whose close never arrives at all (wedged proxies, dev runtimes
+// that never close sockets), and 100 s is generous enough for that job.
+const PRESENCE_STALE_MS = 100_000;
 // Mobs appear in a ring around the players, not on top of them: far enough to
 // hear and see coming, close enough to be worth meeting. A hostile born at the
 // far side of that ring still notices the player it was spawned for — the chase
@@ -392,14 +396,19 @@ export class WorldLive extends DurableObject<Env> {
   // Sweep ghosts: a TCP that died without the runtime ever reporting close
   // (killed browser, wedged proxy, dev runtimes that never close sockets)
   // would otherwise stand in everyone's world forever — pose frames are the
-  // heartbeat, and a live player sends one four times a second, so an entry
-  // with no frames for PRESENCE_STALE_MS is dead. The entry vanishes from
-  // rosters immediately; closing the object side lets the usual close handler
-  // tidy anything the runtime still sees.
+  // heartbeat. A visible player sends one four times a second and even a
+  // hidden, timer-throttled tab sends one about every minute, so the
+  // PRESENCE_STALE_MS window only ever catches connections nobody is driving
+  // anymore. The entry vanishes from rosters immediately; closing the object
+  // side lets the usual close handler tidy anything the runtime still sees.
   private sweepStale(now: number): void {
     for (const [socket, entry] of [...this.presence]) {
       if (now - entry.seen < PRESENCE_STALE_MS) continue;
       this.presence.delete(socket);
+      // A connection nobody drives may never report close either, so the
+      // close handler that trims `sockets` may never run: trim here too, or
+      // the alarm loop keeps ticking for a world with no one in it.
+      this.sockets = this.sockets.filter((s) => s !== socket);
       const name = entry.name;
       this.sendOthers(socket, { type: "leave", name });
       void this.flushHealth(now, name);
@@ -684,7 +693,10 @@ export class WorldLive extends DurableObject<Env> {
       const num = (v: unknown, fallback = 0) => (typeof v === "number" && Number.isFinite(v) ? v : fallback);
       // Identity is the socket's, never the frame's: the name a client sends
       // is decorative and collides the moment two sockets have none.
-      const name = this.nameOf(socket) || "someone";
+      // No identity means the socket was already swept or closed out from
+      // under the client: a frame still in flight must not resurrect it.
+      const name = this.nameOf(socket);
+      if (!name) return;
       const entry = this.presence.get(socket);
       // Death freezes you: a dead player's pose frames stop moving them —
       // unless the stored health says the object is wrong about that.
