@@ -886,7 +886,15 @@ function err(message: string, status = 400, origin: string | null = null): Respo
 async function body<T>(request: Request): Promise<T> {
   const length = Number(request.headers.get("content-length") || 0);
   if (length > 16_000) throw new Error("Request body is too large.");
-  return await request.json() as T;
+  // A POST with no body at all is a legitimate API call (respawn takes no
+  // fields): parse the text, and read an empty one as no fields. Handlers
+  // validate the fields they need either way. Throwing from here would
+  // escape the router's catch (routes `return` handlers un-awaited) and the
+  // client would see the runtime's bare error page instead of a JSON error.
+  const text = await request.text();
+  if (!text) return {} as T;
+  if (text.length > 16_000) throw new Error("Request body is too large.");
+  return JSON.parse(text) as T;
 }
 
 function randomHex(bytes: number): string {
