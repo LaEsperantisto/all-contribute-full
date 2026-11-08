@@ -19,6 +19,7 @@ Vocabulary for All Contribute. No implementation details here.
 - **Block script** — what a block does when a player uses it, authored by the block's creator and run by the server. Behaviour rules still decide where a block may stand; a script decides what happens when it is used.
 - **Interaction** — using the block under the crosshair (**E**). A block with no script does nothing when used; a block whose script fails to run says so, with the interpreter's complaint, so a broken block is never just a dead one.
 - **Menu** — a block script's question to the player: a title and a list of choices. Making a choice is a second interaction with the same block.
+- **Break hook** — the half of a block script that runs as the block is destroyed, while its memory and store are still there to read. It can speak, move the player who swung, and hand its store over to them; then the voxel, its memory, its store and its light column are deleted together. A hook that fails never stops the break.
 - **Look** — the one player choice about visual detail: *flat* (everything painted from its registered colour) or *detailed* (the appearance its publisher supplied). One choice, so a block and an item can never disagree about how they look.
 - **Texture, model, icon** — the appearance attached to published content: a block's surface image, the shape it asks for, an item's picture. All optional; the registered colour is the fallback for anyone on *flat*.
 - **Built-in item** — an item owned by SYSTEM under the `builtin:` namespace. Immutable for everyone.
@@ -26,7 +27,7 @@ Vocabulary for All Contribute. No implementation details here.
 - **Appearance** — the four colours an account owns for its avatar: head, body, legs and eyes. Stored per user, relayed on presence frames, and re-coloured live. Eyes are drawn on the head, so they are the only part that says which way a body is facing.
 - **Entity / mob** — a creature the world object simulates: it walks on the surface, and is either hostile (seeks the nearest living player within a 40-block sphere, damages them when the 3D gap closes to 1.8 blocks) or peaceful (wanders). Range is measured in all three axes, so altitude is protection; only the mob's *steering* is horizontal. Hostility is a property of the creature, not of the player.
 - **Health** — a player's 0–20 life total, owned by the server. Zero means dead: no movement, no damage, and the only way back is respawn.
-- **Respawn** — returning a dead player to the surface spawn with full health.
+- **Respawn** — returning a dead player to their spawn anchor with full health: the surface spawn, unless a block script has set an anchor for that account.
 
 ## World
 
@@ -35,7 +36,10 @@ Vocabulary for All Contribute. No implementation details here.
 - **Edit** — a player-caused world change: a placement or a cleared voxel, recorded at its `(x, y, z)`. The world is base terrain plus edits.
 - **Voxel record (composite id)** — the number a voxel cell actually stores for a block, and the entry in a thread's voxel tables that turns a block name into it. The numbers are positional and shared: every thread that touches voxels has to use the same one for the same name, or one thread's placement reads as another's different block. A name only encodes when its record slot decodes back to that name; blocks the terrain never generates have to be aligned to the numbers the server-side engine already used, never renumbered, because an unrecorded name encodes as air and a placement writes nothing and stays silent.
 - **Voxel state** — what a block script remembers about a particular voxel. It belongs to the place, not to the player or the block type: two identical blocks in two places are independent, and breaking the block forgets it.
+- **Voxel store** — the item stacks a block script keeps inside the voxel it stands in. Like the script's memory it belongs to the place, so two identical blocks can hold different things; when the voxel is broken its contents go to whoever broke it and the store is deleted with it.
 - **Light column** — a column of coloured light running from a voxel to the top of the world, switched on and off by the block standing there. It is part of the world's state, so it survives a reload and is there for a player who arrives later.
+- **Derived world row** — a row kept *about* a voxel to make reads cheap or a late joiner current (catch-up log, block script memory, light column, voxel store), as opposed to the row that says what stands there. It only means anything while the edit table agrees with it; once the voxel it describes is gone, the row is stale and must not be allowed to paint anything.
+- **World resync** — the admin's repair switch: delete the derived rows that lost their voxel, replay every surviving edit and light column to everyone, and have each client rebuild its world from what the database says. Nothing real is touched; a block a browser painted that the database never had disappears.
 
 ## Ownership and hosting
 

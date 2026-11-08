@@ -1,6 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { baseBlock, heightAt, WORLD_Y } from "./terrain";
-import { runBlockScript, type ScriptState } from "./lua";
+import { runBlockScript, type ScriptOutcome, type ScriptState } from "./lua";
 
 export interface Env {
   DB: D1Database;
@@ -41,6 +41,7 @@ function sanitizeAppearance(raw: unknown): Appearance | undefined {
 }
 
 const MAX_HEALTH = 20;
+const MAX_STACK = 999; // mirrors the inventories quantity CHECK
 
 // Live fan-out for the shared world: keeps connected players' WebSockets and
 // broadcasts each world edit. No hibernation (free tier): sockets live in
@@ -146,6 +147,36 @@ export class WorldLive extends DurableObject<Env> {
       return new Response("ok");
     }
 
+    // Internal REST -> DO replay: the REST handler has just re-read
+    // `world_edits` from D1, so fan that truth back out. The object keeps no
+    // copy of the world — its only world belief is the column-top cache, and
+    // that goes too, so the next mob/height read comes from D1 as well.
+    if (request.method === "POST" && url.pathname === "/replay") {
+      const message = await request.json().catch(() => null) as
+        { cells?: unknown; beams?: unknown; announce?: unknown } | null;
+      this.columns.clear();
+      const cellOf = (raw: unknown): { x: number; y: number; z: number } | null => {
+        if (!raw || typeof raw !== "object") return null;
+        const cell = raw as Record<string, unknown>;
+        const x = Number(cell.x), y = Number(cell.y), z = Number(cell.z);
+        return Number.isInteger(x) && Number.isInteger(y) && Number.isInteger(z) ? { x, y, z } : null;
+      };
+      for (const raw of Array.isArray(message?.cells) ? message!.cells : []) {
+        const cell = cellOf(raw);
+        if (cell) this.broadcast({ type: "edit", ...cell, block_id: String((raw as Record<string, unknown>).block_id ?? "air") });
+      }
+      for (const raw of Array.isArray(message?.beams) ? message!.beams : []) {
+        const cell = cellOf(raw);
+        const colour = (raw as Record<string, unknown>).colour;
+        if (cell && typeof colour === "string") this.broadcast({ type: "beam", ...cell, colour });
+      }
+      // One frame per resync, after the cells: clients throw away their own
+      // overlay and re-read the snapshot, which also un-paints blocks the
+      // snapshot never had.
+      if (message?.announce) this.broadcast({ type: "resync" });
+      return new Response("ok");
+    }
+
     // Internal REST -> DO notifications: the REST handler has already
     // persisted the change; sync the in-memory presence and push a frame so
     // every socket of that player updates at once.
@@ -169,6 +200,26 @@ export class WorldLive extends DurableObject<Env> {
         this.sendToName(name, frame);
         // Other players watching must stand the body back up too.
         if (respawn) this.broadcast({ type: "up", name });
+      }
+      return new Response("ok");
+    }
+
+    // A block script moved the player: their sockets must hear it, or their own
+    // next pose frame would drag them back to where they were. The presence
+    // entry moves too, so everyone else sees the jump.
+    if (request.method === "POST" && url.pathname === "/move") {
+      const payload = await request.json().catch(() => null) as
+        { name?: unknown; x?: unknown; y?: unknown; z?: unknown } | null;
+      const name = String(payload?.name || "");
+      const x = Number(payload?.x), y = Number(payload?.y), z = Number(payload?.z);
+      if (name && Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(z)) {
+        for (const entry of this.presence.values()) {
+          if (entry.name !== name) continue;
+          entry.x = x; entry.y = y; entry.z = z;
+          entry.vx = 0; entry.vy = 0; entry.vz = 0;
+        }
+        this.sendToName(name, { type: "move", name, x, y, z });
+        this.broadcast({ type: "roster", players: [...this.presence.values()].map(wirePose) });
       }
       return new Response("ok");
     }
@@ -800,10 +851,37 @@ async function publishEdit(env: Env, x: number, y: number, z: number, blockId: s
   await publishFrame(env, { type: "edit", x, y, z, block_id: blockId });
 }
 
+// `world_edits` is the whole truth about the world; the catch-up log, the
+// scripted blocks' per-cell memory and the cached light columns are all derived
+// from it. A derived row can outlive its cell — deleting a block from the
+// registry removes its `world_edits` rows and leaves the others behind — which
+// is exactly "the world says a block is here, D1 says it isn't". Anything whose
+// cell is gone is stale by construction, so it gets pruned.
+const ORPHAN_COUNT = (table: string) =>
+  `SELECT COUNT(*) AS n FROM ${table} w WHERE NOT EXISTS (SELECT 1 FROM world_edits e WHERE e.x=w.x AND e.y=w.y AND e.z=w.z)`;
+const ORPHAN_PRUNE = (table: string) =>
+  `DELETE FROM ${table} WHERE NOT EXISTS (SELECT 1 FROM world_edits e WHERE e.x=${table}.x AND e.y=${table}.y AND e.z=${table}.z)`;
+
+async function pruneOrphanWorldRows(env: Env): Promise<{ log: number; state: number; beams: number; inv: number }> {
+  const [log, state, beams, inv] = await Promise.all([
+    env.DB.prepare(ORPHAN_COUNT("world_log")).first<{ n: number }>(),
+    env.DB.prepare(ORPHAN_COUNT("block_state")).first<{ n: number }>(),
+    env.DB.prepare(ORPHAN_COUNT("block_beams")).first<{ n: number }>(),
+    env.DB.prepare(ORPHAN_COUNT("block_inventory")).first<{ n: number }>()
+  ]);
+  await env.DB.batch([
+    env.DB.prepare(ORPHAN_PRUNE("world_log")),
+    env.DB.prepare(ORPHAN_PRUNE("block_state")),
+    env.DB.prepare(ORPHAN_PRUNE("block_beams")),
+    env.DB.prepare(ORPHAN_PRUNE("block_inventory"))
+  ]);
+  return { log: log?.n ?? 0, state: state?.n ?? 0, beams: beams?.n ?? 0, inv: inv?.n ?? 0 };
+}
+
 // Tell the live object about a health change made over REST (respawn, eat) so
 // its in-memory presence agrees and live sockets update. If the object is not
 // running this is a harmless no-op.
-async function notifyLive(env: Env, endpoint: "respawn" | "health", payload: unknown): Promise<void> {
+async function notifyLive(env: Env, endpoint: "respawn" | "health" | "move", payload: unknown): Promise<void> {
   try {
     const stub = env.WORLD_LIVE.get(env.WORLD_LIVE.idFromName("world"));
     await stub.fetch(
@@ -1046,32 +1124,118 @@ async function handleBreak(request: Request, env: Env, origin: string | null): P
   const dropId = dropper?.id ?? current;
 
   const stack = await env.DB.prepare("SELECT quantity FROM inventories WHERE user_id=? AND item_id=?").bind(auth.user.id, dropId).first<StackRow>();
-  if (stack && stack.quantity >= 999)
+  if (stack && stack.quantity >= MAX_STACK)
     return json({ error: "That stack is full (999). Make room before breaking more.", code: "inventory_full" }, 400, origin);
 
+  // A scripted block gets one last say before its cell is wiped: `on_break`
+  // still reads its own memory, can toast and log, can move the player, and its
+  // store is handed to the breaker (this engine has no ground drops, so a cell's
+  // items go straight into the stack that broke it). A failing hook does NOT
+  // stop the break — the block is broken either way; the player just hears the
+  // interpreter's message, the same way a broken menu does.
+  const scriptRow = await env.DB.prepare("SELECT script FROM blocks WHERE id=?").bind(current)
+    .first<{ script: string | null }>();
+  let run: ScriptOutcome | null = null;
+  let contents: { item: string; qty: number }[];
+  if (scriptRow?.script) {
+    const rows = await env.DB.prepare("SELECT key,value FROM block_state WHERE x=? AND y=? AND z=?")
+      .bind(x, y, z).all<{ key: string; value: string | null }>();
+    const values = new Map<string, string | number | null>();
+    for (const row of rows.results) values.set(row.key, stateValue(row.value));
+    const [inv, stacks, pos] = await Promise.all([
+      loadBlockInventory(env, x, y, z),
+      loadStacks(env, auth.user.id),
+      loadPlayerPosition(env, auth.user.id)
+    ]);
+    run = runBlockScript(
+      scriptRow.script,
+      "on_break",
+      { player: auth.user.username, x, y, z },
+      // The cell dies with its memory: the hook may read it, writes go with it.
+      { get: (k) => values.get(k) ?? null, set: () => { /* dropped with the row */ } },
+      { inv, stacks, pos, missingEntryIsNoop: true }
+    );
+    if (!run.ok) console.error(`on_break failed for ${current} at ${x},${y},${z}: ${run.error}`);
+    // What the cell ends up holding is what the breaker takes: the store as the
+    // hook left it, or the preloaded one when there was no hook to run.
+    contents = run.stored.length > 0
+      ? run.stored.filter((s) => s.qty > 0)
+      : [...inv].map(([item, qty]) => ({ item, qty }));
+  } else {
+    contents = [...await loadBlockInventory(env, x, y, z)].map(([item, qty]) => ({ item, qty }));
+  }
+
+  const beam = await env.DB.prepare("SELECT colour FROM block_beams WHERE x=? AND y=? AND z=?")
+    .bind(x, y, z).first<{ colour: string }>();
+
+  // One write per item for everything the breaker ends up holding — the ordinary
+  // drop, whatever the hook handed over, and the contents of the cell — so two
+  // grants of the same id can never clobber each other. A scripted block's
+  // memory belongs to the cell: breaking it clears state, light column and store
+  // together, and takes the column down on every connected client.
   await env.DB.batch([
-    env.DB.prepare(
-      "INSERT INTO inventories(user_id,item_id,quantity) VALUES(?,?,1) ON CONFLICT(user_id,item_id) DO UPDATE SET quantity=quantity+1, updated_at=CURRENT_TIMESTAMP"
-    ).bind(auth.user.id, dropId),
+    ...stackStatements(
+      env, auth.user.id,
+      [{ item: dropId, qty: 1 }, ...contents, ...(run?.gives ?? [])],
+      run?.takes ?? []
+    ),
     env.DB.prepare(
       "INSERT INTO world_edits(x,y,z,block_id,placed_by) VALUES(?,?,?,?,?) ON CONFLICT(x,y,z) DO UPDATE SET block_id='air', placed_by=excluded.placed_by, created_at=CURRENT_TIMESTAMP"
     ).bind(x, y, z, "air", auth.user.id),
     env.DB.prepare("INSERT INTO world_log(x,y,z,block_id) VALUES(?,?,?,?)").bind(x, y, z, "air"),
-    env.DB.prepare("DELETE FROM world_log WHERE seq <= (SELECT MAX(seq) - ? FROM world_log)").bind(WORLD_LOG_KEEP)
+    env.DB.prepare("DELETE FROM world_log WHERE seq <= (SELECT MAX(seq) - ? FROM world_log)").bind(WORLD_LOG_KEEP),
+    env.DB.prepare("DELETE FROM block_state WHERE x=? AND y=? AND z=?").bind(x, y, z),
+    env.DB.prepare("DELETE FROM block_beams WHERE x=? AND y=? AND z=?").bind(x, y, z),
+    env.DB.prepare("DELETE FROM block_inventory WHERE x=? AND y=? AND z=?").bind(x, y, z)
   ]);
   await publishEdit(env, x, y, z, "air");
-
-  // A scripted block's memory belongs to the cell, not to the block
-  // definition: breaking it clears its stored state and takes down any light
-  // column it had switched on.
-  const beam = await env.DB.prepare("SELECT colour FROM block_beams WHERE x=? AND y=? AND z=?")
-    .bind(x, y, z).first<{ colour: string }>();
-  await env.DB.batch([
-    env.DB.prepare("DELETE FROM block_state WHERE x=? AND y=? AND z=?").bind(x, y, z),
-    env.DB.prepare("DELETE FROM block_beams WHERE x=? AND y=? AND z=?").bind(x, y, z)
-  ]);
   if (beam) await publishFrame(env, { type: "beam", x, y, z, colour: null });
-  return json({ ok: true, x, y, z, dropped: dropId }, 200, origin);
+
+  // A hook's teleports and anchors belong to the player, not the dying cell.
+  if (run) await applyScriptMoves(env, auth.user.id, auth.user.username, run.moves);
+
+  return json({ ok: true, x, y, z, dropped: dropId, contents, toasts: run?.toasts ?? [] }, 200, origin);
+}
+
+// The admin's repair switch: re-run the edit table. D1's `world_edits` is the
+// whole truth about the world, so the repair is to prune everything derived that
+// lost its cell, replay the surviving cells to every connected player, and tell
+// each client to rebuild its own view from the snapshot — which also clears
+// blocks the client painted that the database never had. Same exact-username
+// gate as the other admin tools.
+const RESYNC_MAX_CELLS = 20_000;
+const RESYNC_CHUNK = 2_000;
+
+async function handleWorldResync(request: Request, env: Env, origin: string | null): Promise<Response> {
+  const auth = await authenticate(request, env);
+  if (!auth) return err("Log in first.", 401, origin);
+  if (!isAdminUser(auth.user.username)) return err("Only the admin account can resync the world.", 403, origin);
+
+  const cleared = await pruneOrphanWorldRows(env);
+  const { results } = await env.DB
+    .prepare("SELECT x,y,z,block_id FROM world_edits ORDER BY x,y,z LIMIT ?")
+    .bind(RESYNC_MAX_CELLS + 1).all<EditRow>();
+  const truncated = results.length > RESYNC_MAX_CELLS;
+  const cells = results.slice(0, RESYNC_MAX_CELLS);
+  const beams = await listBeams(env);
+  const stub = env.WORLD_LIVE.get(env.WORLD_LIVE.idFromName("world"));
+  for (let i = 0; i < Math.max(cells.length, 1); i += RESYNC_CHUNK) {
+    await stub.fetch(new Request("https://world-live.internal/replay", {
+      method: "POST",
+      body: JSON.stringify({
+        cells: cells.slice(i, i + RESYNC_CHUNK),
+        beams: i === 0 ? beams : [],
+        announce: i + RESYNC_CHUNK >= cells.length
+      })
+    }));
+  }
+  return json({
+    ok: true,
+    replayed: cells.length,
+    truncated,
+    beams: beams.length,
+    stale: cleared
+  }, 200, origin);
 }
 
 // ---- scripted blocks ---------------------------------------------------------
@@ -1095,6 +1259,110 @@ async function listBeams(env: Env): Promise<BeamRow[]> {
 function stateValue(raw: string | null): string | number | null {
   if (raw === null) return null;
   return raw !== "" && /^-?\d+(\.\d+)?$/.test(raw) ? Number(raw) : raw;
+}
+
+// The interpreter never touches the database, so a run's effects on the world —
+// teleports, respawn anchors, item handouts, the cell's own store — are
+// preloaded before the run and flushed by the caller afterwards, in the same
+// batch as everything else that request writes.
+
+async function loadBlockInventory(env: Env, x: number, y: number, z: number): Promise<Map<string, number>> {
+  const { results } = await env.DB.prepare(
+    "SELECT item_id,quantity FROM block_inventory WHERE x=? AND y=? AND z=?"
+  ).bind(x, y, z).all<{ item_id: string; quantity: number }>();
+  const inv = new Map<string, number>();
+  for (const row of results) inv.set(row.item_id, Math.max(0, Math.min(MAX_STACK, Number(row.quantity))));
+  return inv;
+}
+
+async function loadStacks(env: Env, userId: string): Promise<Map<string, number>> {
+  const { results } = await env.DB.prepare("SELECT item_id,quantity FROM inventories WHERE user_id=?")
+    .bind(userId).all<{ item_id: string; quantity: number }>();
+  const stacks = new Map<string, number>();
+  for (const row of results) stacks.set(row.item_id, Number(row.quantity));
+  return stacks;
+}
+
+async function loadPlayerPosition(env: Env, userId: string): Promise<{ x: number; y: number; z: number } | null> {
+  const row = await env.DB.prepare("SELECT x,y,z FROM player_state WHERE user_id=?").bind(userId)
+    .first<{ x: number; y: number; z: number }>();
+  return row ? { x: Number(row.x), y: Number(row.y), z: Number(row.z) } : null;
+}
+
+// The cell's final store as written statements: quantity 0 means the row goes.
+function storeStatements(
+  env: Env,
+  x: number, y: number, z: number,
+  stored: { item: string; qty: number }[]
+): D1PreparedStatement[] {
+  const stmts: D1PreparedStatement[] = [];
+  for (const s of stored) {
+    if (s.qty <= 0) {
+      stmts.push(env.DB.prepare(
+        "DELETE FROM block_inventory WHERE x=? AND y=? AND z=? AND item_id=?"
+      ).bind(x, y, z, s.item));
+    } else {
+      stmts.push(env.DB.prepare(
+        "INSERT INTO block_inventory(x,y,z,item_id,quantity,updated_at) VALUES(?,?,?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(x,y,z,item_id) DO UPDATE SET quantity=excluded.quantity, updated_at=CURRENT_TIMESTAMP"
+      ).bind(x, y, z, s.item, s.qty));
+    }
+  }
+  return stmts;
+}
+
+// Gives and takes on the same item cancel to ONE upsert, so two script effects
+// can never clobber each other inside one batch.
+function stackStatements(
+  env: Env,
+  userId: string,
+  gives: { item: string; qty: number }[],
+  takes: { item: string; qty: number }[]
+): D1PreparedStatement[] {
+  const delta = new Map<string, number>();
+  for (const g of gives) delta.set(g.item, (delta.get(g.item) ?? 0) + g.qty);
+  for (const t of takes) delta.set(t.item, (delta.get(t.item) ?? 0) - t.qty);
+  const stmts: D1PreparedStatement[] = [];
+  for (const [item, d] of delta) {
+    if (d > 0) {
+      stmts.push(env.DB.prepare(
+        "INSERT INTO inventories(user_id,item_id,quantity) VALUES(?,?,?) ON CONFLICT(user_id,item_id) DO UPDATE SET quantity=MIN(?,quantity+?), updated_at=CURRENT_TIMESTAMP"
+      ).bind(userId, item, Math.min(MAX_STACK, d), MAX_STACK, d));
+    } else if (d < 0) {
+      stmts.push(env.DB.prepare(
+        "UPDATE inventories SET quantity=MAX(0,quantity+?), updated_at=CURRENT_TIMESTAMP WHERE user_id=? AND item_id=?"
+      ).bind(d, userId, item));
+    }
+  }
+  return stmts;
+}
+
+// Teleports and anchors outlive the request that wrote them: the live object
+// must hear about a move, or its cached presence would push the player back.
+async function applyScriptMoves(
+  env: Env,
+  userId: string,
+  username: string,
+  moves: { kind: "position" | "respawn"; x: number; y: number; z: number }[]
+): Promise<void> {
+  for (const m of moves) {
+    if (m.kind === "respawn") {
+      // The insert side has to be a complete row: x/y/z are NOT NULL, and
+      // SQLite checks them even when the row already exists and the update side
+      // runs. Only a player who has never moved takes these defaults.
+      const fresh = defaultSpawnState();
+      await env.DB.prepare(
+        "INSERT INTO player_state(user_id,x,y,z,yaw,pitch,health,spawn_x,spawn_y,spawn_z)" +
+        " SELECT id,?,?,?,0,0,20,?,?,? FROM users WHERE id=?" +
+        " ON CONFLICT(user_id) DO UPDATE SET spawn_x=excluded.spawn_x, spawn_y=excluded.spawn_y, spawn_z=excluded.spawn_z, updated_at=CURRENT_TIMESTAMP"
+      ).bind(fresh.x, fresh.y, fresh.z, m.x, m.y, m.z, userId).run();
+      continue;
+    }
+    await env.DB.prepare(
+      "INSERT INTO player_state(user_id,x,y,z,yaw,pitch,health) SELECT id,?,?,?,0,0,? FROM users WHERE id=?" +
+      " ON CONFLICT(user_id) DO UPDATE SET x=excluded.x, y=excluded.y, z=excluded.z, yaw=0, pitch=0, updated_at=CURRENT_TIMESTAMP"
+    ).bind(m.x, m.y, m.z, MAX_HEALTH, userId).run();
+    await notifyLive(env, "move", { name: username, x: m.x, y: m.y, z: m.z });
+  }
 }
 
 async function handleBlockInteract(request: Request, env: Env, origin: string | null): Promise<Response> {
@@ -1129,15 +1397,25 @@ async function handleBlockInteract(request: Request, env: Env, origin: string | 
   const before = await env.DB.prepare("SELECT colour FROM block_beams WHERE x=? AND y=? AND z=?")
     .bind(x, y, z).first<{ colour: string }>();
 
+  // Same preload/flush shape for the rest of the world the script can touch:
+  // the acting player's position and stacks, and this cell's own store.
+  const [inv, stacks, pos] = await Promise.all([
+    loadBlockInventory(env, x, y, z),
+    loadStacks(env, auth.user.id),
+    loadPlayerPosition(env, auth.user.id)
+  ]);
+
   const outcome = runBlockScript(
     block.script,
     key ? "on_choice" : "on_interact",
-    { player: auth.user.username, key },
-    state
+    { player: auth.user.username, key, x, y, z },
+    state,
+    { inv, stacks, pos }
   );
   if (!outcome.ok) {
     // A broken script is the author's bug, not the player's — say so plainly
-    // rather than pretending the block did nothing.
+    // rather than pretending the block did nothing. Nothing from a failed run
+    // is applied: no state, no beams, no items, no moves.
     return json({ ok: false, reason: "script-error", error: outcome.error ?? "Script failed." }, 200, origin);
   }
 
@@ -1148,6 +1426,8 @@ async function handleBlockInteract(request: Request, env: Env, origin: string | 
       "INSERT INTO block_state(x,y,z,key,value,updated_at) VALUES(?,?,?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(x,y,z,key) DO UPDATE SET value=excluded.value, updated_at=CURRENT_TIMESTAMP"
     ).bind(x, y, z, k, String(v)));
   }
+  flush.push(...storeStatements(env, x, y, z, outcome.stored));
+  flush.push(...stackStatements(env, auth.user.id, outcome.gives, outcome.takes));
   flush.push(env.DB.prepare("DELETE FROM block_beams WHERE x=? AND y=? AND z=?").bind(x, y, z));
   const beams: string[] = [];
   for (const beam of outcome.beams) {
@@ -1162,12 +1442,18 @@ async function handleBlockInteract(request: Request, env: Env, origin: string | 
   if (beams.length) await publishFrame(env, { type: "beam", x, y, z, colour: beams[beams.length - 1] });
   else if (before) await publishFrame(env, { type: "beam", x, y, z, colour: null });
 
+  // The player's own world moved: write it and let the live object know, or the
+  // next presence frame would shove them back to where they were.
+  await applyScriptMoves(env, auth.user.id, auth.user.username, outcome.moves);
+
   return json({
     ok: true,
     name: block.name,
     title: outcome.menu?.title ?? null,
     menu: outcome.menu?.options ?? null,
-    toasts: outcome.toasts
+    toasts: outcome.toasts,
+    moved: outcome.moves.length > 0,
+    items: outcome.gives.length + outcome.takes.length > 0
   }, 200, origin);
 }
 
@@ -1292,7 +1578,18 @@ function defaultSpawnState(): { x: number; y: number; z: number; yaw: number; pi
 async function handleRespawn(request: Request, env: Env, origin: string | null): Promise<Response> {
   const auth = await authenticate(request, env);
   if (!auth) return err("Log in first.", 401, origin);
-  const state = defaultSpawnState();
+  // Where a player wakes up is theirs to lose and to win back: `defaultSpawnState`
+  // is the fallback, a script's `set_player_respawn_position` is the anchor.
+  const anchor = await env.DB.prepare("SELECT spawn_x,spawn_y,spawn_z FROM player_state WHERE user_id=?")
+    .bind(auth.user.id).first<{ spawn_x: number | null; spawn_y: number | null; spawn_z: number | null }>();
+  // Number(null) is 0, which would wake every player who never set an anchor at
+  // the bottom of the world: an anchor exists only when the column holds a
+  // number.
+  const at = [anchor?.spawn_x, anchor?.spawn_y, anchor?.spawn_z]
+    .map(v => v === null || v === undefined ? null : Number(v));
+  const state = at.every(v => v !== null && Number.isFinite(v))
+    ? { x: at[0]!, y: at[1]!, z: at[2]!, yaw: 0, pitch: 0 }
+    : defaultSpawnState();
   await env.DB.prepare(
     `INSERT INTO player_state(user_id,x,y,z,yaw,pitch,health) VALUES(?,?,?,?,?,?,?)
      ON CONFLICT(user_id) DO UPDATE SET x=excluded.x, y=excluded.y, z=excluded.z,
@@ -1301,6 +1598,9 @@ async function handleRespawn(request: Request, env: Env, origin: string | null):
   // The live object clears the dead flag and pushes a respawn frame so the
   // player's sockets and the simulation agree immediately.
   await notifyLive(env, "respawn", { name: auth.user.username, health: MAX_HEALTH, state });
+  // ...and its cached presence moves with them, or the body would keep standing
+  // where they died for everyone else.
+  await notifyLive(env, "move", { name: auth.user.username, x: state.x, y: state.y, z: state.z });
   return json({ ok: true, health: MAX_HEALTH, state }, 200, origin);
 }
 
@@ -1543,6 +1843,9 @@ export default {
         await env.DB.prepare("DELETE FROM world_edits WHERE block_id=?").bind(id).run();
         await env.DB.prepare("DELETE FROM recipes WHERE result_id=? OR ingredients_json LIKE ?")
           .bind(id, `%"${id}"%`).run();
+        // The edits are gone, so the log rows, script memory and light columns
+        // that pointed at them are stale the same instant.
+        const stale = await pruneOrphanWorldRows(env);
         for (const cell of placed.results) {
           await publishEdit(env, cell.x, cell.y, cell.z, "air");
         }
@@ -1551,7 +1854,7 @@ export default {
         await env.DB.prepare("DELETE FROM inventories WHERE item_id=?").bind(id).run();
         return json({
           ok: true,
-          cleared: { placed: placed.results.length, recipes: recipes.results.length },
+          cleared: { placed: placed.results.length, recipes: recipes.results.length, ...stale },
         }, 200, origin);
       }
 
@@ -1726,8 +2029,13 @@ export default {
             .bind(x0, x1, y0, y1, z0, z1).all<EditRow>(),
           // Newest first, then back in order: a client whose cursor fell behind
           // the retained window is corrected by the `edits` snapshot anyway.
+          // A log row only means anything while its cell still reads that same
+          // block in `world_edits`; anything else is a leftover from a deleted
+          // block and would repaint a cell the database says is empty.
           env.DB.prepare(`SELECT seq,x,y,z,block_id FROM (
-              SELECT seq,x,y,z,block_id FROM world_log WHERE seq > ? ORDER BY seq DESC LIMIT ${WORLD_LOG_KEEP}
+              SELECT seq,x,y,z,block_id FROM world_log l WHERE seq > ? AND EXISTS (
+                SELECT 1 FROM world_edits e WHERE e.x=l.x AND e.y=l.y AND e.z=l.z AND e.block_id=l.block_id
+              ) ORDER BY seq DESC LIMIT ${WORLD_LOG_KEEP}
             ) ORDER BY seq ASC`)
             .bind(since).all<LogRow>(),
           env.DB.prepare("SELECT COALESCE(MAX(seq), 0) AS head FROM world_log").first<{ head: number }>(),
@@ -1738,6 +2046,7 @@ export default {
 
       if (path === "/api/world/place" && request.method === "POST") return handlePlace(request, env, origin);
       if (path === "/api/world/break" && request.method === "POST") return handleBreak(request, env, origin);
+      if (path === "/api/world/resync" && request.method === "POST") return handleWorldResync(request, env, origin);
       if (path === "/api/block/interact" && request.method === "POST") return handleBlockInteract(request, env, origin);
       if (path === "/api/player/state" && request.method === "GET") return handleGetPlayerState(request, env, origin);
       if (path === "/api/player/state" && request.method === "POST") return handlePutPlayerState(request, env, origin);

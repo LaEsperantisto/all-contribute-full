@@ -16,6 +16,14 @@ export interface ScriptOutcome {
   beams: { colour: string }[];
   toasts: string[];
   logs: string[];
+  // Effects on the host world. The interpreter never touches the database, so
+  // a move, an item handout or a cell-store write is RECORDED here and applied
+  // by the caller in its own flush — the same pattern as state_set writes.
+  // `stored` is the cell's final inventory; qty 0 means the row goes away.
+  moves: { kind: "position" | "respawn"; x: number; y: number; z: number }[];
+  gives: { item: string; qty: number }[];
+  takes: { item: string; qty: number }[];
+  stored: { item: string; qty: number }[];
 }
 
 // ---------------------------------------------------------------------------
@@ -31,6 +39,11 @@ const MAX_MENU_KEY = 32;
 const MAX_MENU_OPTIONS = 12;
 const MAX_BEAM_COLOUR = 32;
 const MAX_OUTPUT_ITEMS = 64; // beams / toasts / logs per run
+const MAX_INV_ITEMS = 32;    // distinct item ids one cell can hold
+const MAX_STACK = 999;       // mirrors the inventory quantity bound
+const MAX_MOVES = 8;         // position/anchor writes per run
+// Item ids are registry ids: `builtin:apple`, `player:user:ns:item`.
+const ITEM_ID = /^[a-z0-9_]{1,32}(:[a-z0-9_]{1,32}){1,3}$/;
 const MAX_CALL_DEPTH = 128;
 const DEFAULT_MAX_INSTRUCTIONS = 20000;
 const DEFAULT_WALL_MS = 50;
@@ -1636,14 +1649,34 @@ function strFormat(f: string, args: LuaValue[]): string {
 export function runBlockScript(
   src: string,
   fn: string,
-  args: { player: string; key?: string },
+  // `x/y/z` are the cell the script belongs to; they arrive as globals too, so
+  // an author never has to thread coordinates through a function signature.
+  args: { player: string; key?: string; x?: number; y?: number; z?: number },
   state: ScriptState,
-  opts?: { maxInstructions?: number; wallMs?: number }
+  // Preloaded host facts the run may read and change: the acting player's
+  // position, their item stacks, and this cell's own store. Nothing is written
+  // back here — the caller flushes what `outcome` records.
+  opts?: {
+    maxInstructions?: number;
+    wallMs?: number;
+    pos?: { x: number; y: number; z: number } | null;
+    stacks?: Map<string, number>;
+    inv?: Map<string, number>;
+    missingEntryIsNoop?: boolean;
+  }
 ): ScriptOutcome {
   const beams: { colour: string }[] = [];
   const toasts: string[] = [];
   const logs: string[] = [];
-  const outcome: ScriptOutcome = { ok: true, beams, toasts, logs };
+  const moves: { kind: "position" | "respawn"; x: number; y: number; z: number }[] = [];
+  const gives: { item: string; qty: number }[] = [];
+  const takes: { item: string; qty: number }[] = [];
+  const outcome: ScriptOutcome = { ok: true, beams, toasts, logs, moves, gives, takes, stored: [] };
+  const stacks = opts?.stacks ?? new Map<string, number>();
+  const inv = opts?.inv ?? new Map<string, number>();
+  // Every id the cell ever held this run, including ones emptied to 0: those
+  // have to come out of the table, so the caller needs to hear about them.
+  const invKeys = new Set<string>(inv.keys());
   const ctx: Ctx = {
     steps: 0,
     maxSteps: opts?.maxInstructions ?? DEFAULT_MAX_INSTRUCTIONS,
@@ -1668,6 +1701,9 @@ export function runBlockScript(
 
     globals.vars.set("player", String(args.player ?? ""));
     globals.vars.set("key", typeof args.key === "string" ? args.key : null);
+    globals.vars.set("x", typeof args.x === "number" ? args.x : 0);
+    globals.vars.set("y", typeof args.y === "number" ? args.y : 0);
+    globals.vars.set("z", typeof args.z === "number" ? args.z : 0);
 
     setHost("state_get", (a) => {
       const k = checkStr(a[0] ?? null);
@@ -1769,6 +1805,88 @@ export function runBlockScript(
       return [];
     });
 
+    // ---- the acting player: where they stand, where they wake up -----------
+    // Deliberately argument-free about WHO: every one of these acts on the
+    // player who pressed the key, so a block script cannot reach around them to
+    // someone else. The moves are recorded, not applied: the caller writes them
+    // in its own transaction and tells the live object.
+    setHost("get_player_position", () => {
+      const p = opts?.pos ?? null;
+      return p ? [p.x, p.y, p.z] : [null];
+    });
+    const checkCoord = (v: LuaValue, name: string): number => {
+      const n = toNum(v);
+      if (!Number.isFinite(n) || Math.abs(n) > 1_000_000) throw new LuaError(`'${name}' must be a finite coordinate`);
+      return n;
+    };
+    const recordMove = (host: string, a: LuaValue[]): LuaValue[] => {
+      if (a.length < 3) throw new LuaError(`'${host}' expects a position (x, y, z)`);
+      if (moves.length + 1 > MAX_MOVES) throw new LuaError(`too many moves (limit ${MAX_MOVES})`);
+      moves.push({
+        kind: host === "set_player_respawn_position" ? "respawn" : "position",
+        x: checkCoord(a[0], "x"), y: checkCoord(a[1], "y"), z: checkCoord(a[2], "z")
+      });
+      return [];
+    };
+    setHost("set_player_position", (a) => recordMove("set_player_position", a));
+    setHost("set_player_respawn_position", (a) => recordMove("set_player_respawn_position", a));
+
+    // ---- items: the player's stacks, and the cell's own store --------------
+    const checkItem = (v: LuaValue, host: string): string => {
+      const id = checkStr(v);
+      if (id.length > MAX_STATE_VALUE || !ITEM_ID.test(id)) throw new LuaError(`bad argument #1 to '${host}' (unknown item id)`);
+      return id;
+    };
+    const checkQty = (v: LuaValue, host: string): number => {
+      const q = Math.trunc(toNum(v));
+      if (!(q >= 1 && q <= MAX_STACK)) throw new LuaError(`bad argument #2 to '${host}' (quantity must be 1..${MAX_STACK})`);
+      return q;
+    };
+    setHost("give_item", (a) => {
+      const item = checkItem(a[0] ?? null, "give_item");
+      const qty = checkQty(a[1] ?? null, "give_item");
+      const now = stacks.get(item) ?? 0;
+      const added = Math.min(qty, MAX_STACK - now);
+      if (added > 0) { stacks.set(item, now + added); gives.push({ item, qty: added }); }
+      return [now + added];
+    });
+    setHost("take_item", (a) => {
+      const item = checkItem(a[0] ?? null, "take_item");
+      const qty = checkQty(a[1] ?? null, "take_item");
+      const now = stacks.get(item) ?? 0;
+      const removed = Math.min(qty, now);
+      if (removed > 0) { stacks.set(item, now - removed); takes.push({ item, qty: removed }); }
+      return [removed];
+    });
+    setHost("item_count", (a) => [stacks.get(checkItem(a[0] ?? null, "item_count")) ?? 0]);
+    setHost("inv_add", (a) => {
+      const item = checkItem(a[0] ?? null, "inv_add");
+      const qty = checkQty(a[1] ?? null, "inv_add");
+      const now = inv.get(item) ?? 0;
+      if (now === 0 && invKeys.size + 1 > MAX_INV_ITEMS) {
+        throw new LuaError(`too many kinds of item in one block (limit ${MAX_INV_ITEMS})`);
+      }
+      const added = Math.min(qty, MAX_STACK - now);
+      inv.set(item, now + added);
+      invKeys.add(item);
+      return [now + added];
+    });
+    setHost("inv_take", (a) => {
+      const item = checkItem(a[0] ?? null, "inv_take");
+      const qty = checkQty(a[1] ?? null, "inv_take");
+      const now = inv.get(item) ?? 0;
+      const removed = Math.min(qty, now);
+      inv.set(item, now - removed);
+      invKeys.add(item);
+      return [removed];
+    });
+    setHost("inv_count", (a) => [inv.get(checkItem(a[0] ?? null, "inv_count")) ?? 0]);
+    setHost("inv_list", () => {
+      const listed = new LTable(nextTableId());
+      for (const [item, qty] of inv) if (qty > 0) tset(listed, item, qty);
+      return [listed];
+    });
+
     globals.vars.set("math", libs.math);
     globals.vars.set("string", libs.string);
     globals.vars.set("table", libs.table);
@@ -1824,10 +1942,14 @@ export function runBlockScript(
 
     const target = globals.vars.get(fn) ?? null;
     if (typeof target !== "function") {
+      // A block broken, opened or clicked by a script that never defined this
+      // hook is not a broken script — the caller asked on spec.
+      if (opts?.missingEntryIsNoop) return outcome;
       throw new LuaError(`'${fn}' is not a function (got ${typeName(target)})`);
     }
-    // Positional contract: on_interact(player) / on_choice(key, player). The
-    // globals `player` and `key` carry the same values, so either style works.
+    // Positional contract: on_interact(player) / on_choice(key, player) /
+    // on_break(player). The globals `player`, `key` and the cell's `x/y/z`
+    // carry the same information, so either style works.
     const callArgs: LuaValue[] = args.key !== undefined
       ? [args.key, String(args.player ?? "")]
       : [String(args.player ?? "")];
@@ -1847,10 +1969,16 @@ export function runBlockScript(
       }
     }
 
+    // The cell's store is flushed as a whole: every id it held this run, with
+    // the quantity it ended on (0 deletes the row).
+    for (const item of invKeys) outcome.stored.push({ item, qty: inv.get(item) ?? 0 });
+
     return outcome;
   } catch (e) {
     const message = e instanceof LuaError ? e.message : "internal interpreter error";
-    const failed: ScriptOutcome = { ok: false, error: message, beams, toasts, logs };
+    // A run that failed mid-way is rolled back, not partially applied: the
+    // caller ignores everything recorded on this path.
+    const failed: ScriptOutcome = { ok: false, error: message, beams, toasts, logs, moves, gives, takes, stored: [] };
     if (menu !== undefined) failed.menu = menu;
     return failed;
   }
