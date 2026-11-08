@@ -42,6 +42,9 @@ function sanitizeAppearance(raw: unknown): Appearance | undefined {
 
 const MAX_HEALTH = 20;
 const MAX_STACK = 999; // mirrors the inventories quantity CHECK
+// How often a pose frame from a socket the object thinks is a corpse is allowed
+// to re-read the stored health (see `reviveIfHealthy`).
+const HEALTH_RECHECK_MS = 2000;
 
 // Live fan-out for the shared world: keeps connected players' WebSockets and
 // broadcasts each world edit. No hibernation (free tier): sockets live in
@@ -58,7 +61,19 @@ const MAX_STACK = 999; // mirrors the inventories quantity CHECK
 
 const MAX_MOBS = 12;
 const MOB_TICK_MS = 250;
-const MOB_CHASE_RANGE = 40;
+// Mobs appear in a ring around the players, not on top of them: far enough to
+// hear and see coming, close enough to be worth meeting. A hostile born at the
+// far side of that ring still notices the player it was spawned for — the chase
+// range sits just past the ring — so a world that spawns mobs at a distance
+// never reads as empty.
+const MOB_SPAWN_MIN = 40;
+const MOB_SPAWN_MAX = 50;
+const MOB_CHASE_RANGE = MOB_SPAWN_MAX + 8;
+// A mob nobody can ever see is dead weight against the cap: once it is this far
+// from every connected player it is removed, and the next ticks put a new one
+// back at the ring. Without this, a mob that wandered off keeps its slot forever
+// and the world quietly stops spawning.
+const MOB_DESPAWN_RANGE = 96;
 const MOB_ATTACK_RANGE = 1.8;
 const MOB_ATTACK_COOLDOWN_MS = 1200;
 const PLAYER_ATTACK_RANGE = 6;
@@ -94,6 +109,7 @@ type Presence = {
   x: number; y: number; z: number; yaw: number; pitch: number;
   vx: number; vy: number; vz: number;
   held?: string;
+  heldItem?: string;
   appearance?: Appearance;
   health: number; dead: boolean; healthLoaded: boolean;
 };
@@ -105,6 +121,7 @@ function wirePose(entry: Presence): Record<string, unknown> {
     name: entry.name, x: entry.x, y: entry.y, z: entry.z, yaw: entry.yaw, pitch: entry.pitch,
     vx: entry.vx, vy: entry.vy, vz: entry.vz,
     ...(entry.held ? { held: entry.held } : {}),
+    ...(entry.heldItem ? { heldItem: entry.heldItem } : {}),
     ...(entry.appearance ? { appearance: entry.appearance } : {})
   };
 }
@@ -115,10 +132,21 @@ function sanitizeHeld(raw: unknown): string | undefined {
   return typeof raw === "string" && /^#[0-9a-f]{6}$/i.test(raw) ? raw : undefined;
 }
 
+// The held item's registry ID, so every client can draw that item's own icon
+// in the hand from its registry copy. Same ID grammar the world tables use.
+function sanitizeHeldItem(raw: unknown): string | undefined {
+  return typeof raw === "string" && raw.length <= 64 && validItemId(raw) ? raw : undefined;
+}
+
 // The one admin identity in this deployment: the account literally named
 // "admin". Inventory surgery (add/remove/clear) is theirs alone — players earn
 // and spend items through the world instead. Exact match, no case folding.
 const isAdminUser = (username: string): boolean => username === "admin";
+
+// Internal header the router stamps on a world-socket upgrade: the account the
+// session cookie belongs to. A Durable Object is only reachable through this
+// Worker, and the router deletes any client-supplied value before setting it.
+const WS_IDENTITY = "x-ac-user";
 
 const round2 = (value: number): number => Math.round(value * 100) / 100;
 
@@ -127,6 +155,20 @@ export class WorldLive extends DurableObject<Env> {
   // Presence: socket -> current pose, so joining players see a roster and
   // everyone gets periodic pose fan-out (~5 Hz, client-throttled).
   presence: Map<WebSocket, Presence> = new Map();
+  // Who each socket belongs to: the account behind the session cookie, or a
+  // unique token for a socket that arrived without one. The router stamps it
+  // on the upgrade request; a client frame never decides its own identity.
+  // (It used to: everyone whose client had no username sent the fallback
+  // "someone", so several players shared one avatar and any one of them
+  // leaving removed it from everyone else's screen.)
+  private identities: Map<WebSocket, string> = new Map();
+  // When the account behind a "corpse" socket last re-read its stored health
+  // (`reviveIfHealthy`); the corpse flag lives per socket, health per account.
+  private healthRechecks: Map<string, number> = new Map();
+  // The world's clock, mirrored from D1 so a socket that connects gets the
+  // phase the admin left without another read (null = not dialled yet, so the
+  // client reads the phase off its own wall clock).
+  private clock: { phase: number | null; epoch: number; running: boolean } | null = null;
   mobs: Map<string, Mob> = new Map();
   // Lazily-filled caches that keep D1 reads tiny: column tops (short TTL)
   // and item stats (the registry is immutable for builtins).
@@ -137,13 +179,44 @@ export class WorldLive extends DurableObject<Env> {
   private lastHealthWrite: Map<string, number> = new Map();
   // Per-attacker swing gate (name -> earliest next swing).
   private attackCooldown: Map<string, number> = new Map();
+  // One object instance == one server: the router idFromName()s the stub by
+  // server id, so presence, mobs and the clock are per world by construction.
+  // A Durable Object cannot recover the name its id was made from, so every
+  // internal request carries the server id and the FIRST request binds it —
+  // then it is stored, because alarm() runs against a re-instantiated object
+  // after eviction and its writes must still land in this world's scope.
+  private serverId: string | null = null;
+
+  private async bindServer(id: unknown): Promise<void> {
+    if (this.serverId) return;
+    const stored = await this.ctx.storage.get<string>("server");
+    this.serverId = stored || (typeof id === "string" && id ? id : GLOBAL_SERVER);
+    if (!stored) await this.ctx.storage.put("server", this.serverId);
+  }
+
+  // Every world read/write this object makes is scoped. Before the first
+  // request bound it there is nothing of its own to scope, and `global` keeps
+  // the pre-servers behaviour byte-for-byte.
+  private scope(): string {
+    return this.serverId || GLOBAL_SERVER;
+  }
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
+    if (request.method === "GET" && url.pathname === "/presence") {
+      await this.bindServer(url.searchParams.get("server"));
+      return new Response(JSON.stringify({ count: this.presence.size }), {
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+
     if (request.method === "POST" && url.pathname === "/publish") {
-      const message = await request.json().catch(() => null);
-      if (message) this.broadcast(message);
+      // The wrapper keeps the id off the wire: only `frame` reaches sockets,
+      // so `server` can never leak into a client's frame parser.
+      const message = await request.json().catch(() => null) as { server?: unknown; frame?: unknown } | null;
+      await this.bindServer(message?.server);
+      if (message?.frame) this.broadcast(message.frame);
       return new Response("ok");
     }
 
@@ -153,7 +226,8 @@ export class WorldLive extends DurableObject<Env> {
     // that goes too, so the next mob/height read comes from D1 as well.
     if (request.method === "POST" && url.pathname === "/replay") {
       const message = await request.json().catch(() => null) as
-        { cells?: unknown; beams?: unknown; announce?: unknown } | null;
+        { server?: unknown; cells?: unknown; beams?: unknown; announce?: unknown } | null;
+      await this.bindServer(message?.server);
       this.columns.clear();
       const cellOf = (raw: unknown): { x: number; y: number; z: number } | null => {
         if (!raw || typeof raw !== "object") return null;
@@ -182,24 +256,25 @@ export class WorldLive extends DurableObject<Env> {
     // every socket of that player updates at once.
     if (request.method === "POST" && (url.pathname === "/respawn" || url.pathname === "/health")) {
       const payload = await request.json().catch(() => null) as
-        { name?: unknown; health?: unknown; state?: unknown } | null;
+        { server?: unknown; name?: unknown; health?: unknown; state?: unknown } | null;
+      await this.bindServer(payload?.server);
       const name = String(payload?.name || "");
       const health = Number(payload?.health);
       if (name && Number.isFinite(health)) {
         const clamped = Math.max(0, Math.min(MAX_HEALTH, health));
         const respawn = url.pathname === "/respawn";
-        for (const entry of this.presence.values()) {
-          if (entry.name !== name) continue;
-          entry.health = clamped;
-          entry.healthLoaded = true;
-          entry.dead = !respawn && clamped <= 0;
+        if (respawn) {
+          this.reviveAccount(name, clamped, payload?.state);
+        } else {
+          for (const entry of this.presence.values()) {
+            if (entry.name !== name) continue;
+            entry.health = clamped;
+            entry.healthLoaded = true;
+            entry.dead = clamped <= 0;
+          }
+          this.pendingHealth.delete(name);
+          this.sendToName(name, { type: "health", health: clamped });
         }
-        this.pendingHealth.delete(name);
-        const frame: Record<string, unknown> = { type: respawn ? "respawn" : "health", health: clamped };
-        if (respawn && payload?.state && typeof payload.state === "object") frame.state = payload.state;
-        this.sendToName(name, frame);
-        // Other players watching must stand the body back up too.
-        if (respawn) this.broadcast({ type: "up", name });
       }
       return new Response("ok");
     }
@@ -209,7 +284,8 @@ export class WorldLive extends DurableObject<Env> {
     // entry moves too, so everyone else sees the jump.
     if (request.method === "POST" && url.pathname === "/move") {
       const payload = await request.json().catch(() => null) as
-        { name?: unknown; x?: unknown; y?: unknown; z?: unknown } | null;
+        { server?: unknown; name?: unknown; x?: unknown; y?: unknown; z?: unknown } | null;
+      await this.bindServer(payload?.server);
       const name = String(payload?.name || "");
       const x = Number(payload?.x), y = Number(payload?.y), z = Number(payload?.z);
       if (name && Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(z)) {
@@ -224,10 +300,31 @@ export class WorldLive extends DurableObject<Env> {
       return new Response("ok");
     }
 
+    // The admin dialled the time of day: the Worker has already written the row,
+    // so the object mirrors it and tells everyone looking at the sky at once.
+    if (request.method === "POST" && url.pathname === "/clock") {
+      const payload = await request.json().catch(() => null) as
+        { server?: unknown; phase?: unknown; epoch?: unknown; running?: unknown } | null;
+      await this.bindServer(payload?.server);
+      const dialed = payload?.phase === null || payload?.phase === undefined ? null : Number(payload.phase);
+      this.clock = {
+        phase: dialed === null || !Number.isFinite(dialed) ? null : dialed,
+        epoch: Number(payload?.epoch) || 0,
+        running: payload?.running !== false
+      };
+      this.broadcast({ type: "time", ...this.clock });
+      return new Response("ok");
+    }
+
     if (request.headers.get("Upgrade") === "websocket") {
+      // The upgrade carries no body, so the router passes the server id in the
+      // forwarded query string; the stub is already this world's instance.
+      await this.bindServer(url.searchParams.get("server"));
       const pair = new WebSocketPair();
       const [client, server] = Object.values(pair);
       server.accept();
+      this.identities.set(server, (request.headers.get(WS_IDENTITY) || "").slice(0, 32)
+        || `guest:${crypto.randomUUID().slice(0, 8)}`);
       this.sockets.push(server);
       // The first socket arms the simulation tick; alarm() re-arms it for
       // as long as anyone is connected.
@@ -236,6 +333,7 @@ export class WorldLive extends DurableObject<Env> {
       server.addEventListener("close", () => {
         this.sockets = this.sockets.filter((socket) => socket !== server);
         const name = this.nameOf(server);
+        this.identities.delete(server);
         if (this.presence.delete(server) && name) {
           this.sendOthers(server, { type: "leave", name });
           void this.flushHealth(Date.now(), name);
@@ -245,6 +343,11 @@ export class WorldLive extends DurableObject<Env> {
         type: "roster",
         players: [...this.presence.values()].map(wirePose),
       }));
+      // The sky is the world's, not each browser's: hand the new socket the
+      // admin's dial (or the "not dialled" shape), so a reloaded page wakes up
+      // in the same night everyone else is standing in. Off the handshake path:
+      // the first read of the row is a D1 round trip.
+      void this.clockFrame().then(frame => { try { server.send(JSON.stringify(frame)); } catch { /* socket gone */ } });
       return new Response(null, { status: 101, webSocket: client });
     }
 
@@ -254,6 +357,9 @@ export class WorldLive extends DurableObject<Env> {
   // 250 ms world tick: move mobs, resolve their attacks, mirror health,
   // spawn replacements, then re-arm while anyone is connected.
   async alarm(): Promise<void> {
+    // A post-eviction tick has no request to bind with: re-read the stored id
+    // so this world's mobs keep writing to their own scope.
+    await this.bindServer(null);
     const now = Date.now();
     await this.ensureHealth();
     await this.stepMobs(now);
@@ -275,6 +381,17 @@ export class WorldLive extends DurableObject<Env> {
   private async stepMobs(now: number): Promise<void> {
     const players = [...this.presence.values()].filter(entry => !entry.dead);
     const dt = MOB_TICK_MS / 1000;
+    // Forget anyone far out of everyone's sight, so the cap serves the players
+    // who are actually standing somewhere. A dead player still counts: a mob
+    // beside their body is part of that player's world.
+    const watched = [...this.presence.values()];
+    if (watched.length) {
+      for (const mob of this.mobs.values()) {
+        let nearest = Infinity;
+        for (const entry of watched) nearest = Math.min(nearest, Math.hypot(entry.x - mob.x, entry.z - mob.z));
+        if (nearest > MOB_DESPAWN_RANGE) this.mobs.delete(mob.id);
+      }
+    }
     for (const mob of this.mobs.values()) {
       const spec = MOB_SPECS[mob.kind];
       let target: Presence | null = null;
@@ -351,7 +468,7 @@ export class WorldLive extends DurableObject<Env> {
     if (!live.length) return;
     const anchor = live[Math.floor(Math.random() * live.length)];
     const angle = Math.random() * Math.PI * 2;
-    const distance = 12 + Math.random() * 16; // 12-28 blocks from a player
+    const distance = MOB_SPAWN_MIN + Math.random() * (MOB_SPAWN_MAX - MOB_SPAWN_MIN);
     const x = anchor.x + Math.cos(angle) * distance;
     const z = anchor.z + Math.sin(angle) * distance;
     const kind: MobKind = Math.random() < 0.6 ? "zombie" : "pig";
@@ -376,8 +493,8 @@ export class WorldLive extends DurableObject<Env> {
     let top = heightAt(x, z);
     try {
       const { results } = await this.env.DB
-        .prepare("SELECT y, block_id FROM world_edits WHERE x=? AND z=?")
-        .bind(x, z).all<{ y: number; block_id: string }>();
+        .prepare("SELECT y, block_id FROM world_edits WHERE server_id=? AND x=? AND z=?")
+        .bind(this.scope(), x, z).all<{ y: number; block_id: string }>();
       for (const edit of results)
         if (edit.block_id !== "air" && edit.y > top) top = edit.y;
     } catch (error) {
@@ -385,6 +502,77 @@ export class WorldLive extends DurableObject<Env> {
     }
     this.columns.set(key, { top, at: Date.now() });
     return top;
+  }
+
+  // The clock frame every socket is handed when it arrives: the admin's dial if
+  // one exists, otherwise the "not dialled" shape that leaves each client
+  // reading the phase off its own wall clock (the pre-admin behaviour, and the
+  // reason an undialled world needs no traffic at all).
+  private async clockFrame(): Promise<Record<string, unknown>> {
+    if (this.clock === null) {
+      try {
+        const { results } = await this.env.DB
+          .prepare("SELECT phase, epoch_ms, running FROM world_clock WHERE id=1 AND server_id=?")
+          .bind(this.scope()).all<{ phase: number | null; epoch_ms: number; running: number }>();
+        const row = results[0];
+        this.clock = {
+          phase: row?.phase === null || row?.phase === undefined ? null : Number(row.phase),
+          epoch: Number(row?.epoch_ms) || 0,
+          running: (row?.running ?? 1) !== 0
+        };
+      } catch (error) {
+        console.error("Clock read failed:", error);
+        return { type: "time", phase: null, epoch: 0, running: true };
+      }
+    }
+    return { type: "time", ...this.clock };
+  }
+
+  // Stand an account back up in the object's view of every socket it owns:
+  // its health, the corpse flag, and the frames that lift the body on its own
+  // screen (`respawn`) and in everyone else's (`up`).
+  private reviveAccount(name: string, health: number, state?: unknown): void {
+    for (const entry of this.presence.values()) {
+      if (entry.name !== name) continue;
+      entry.health = health;
+      entry.healthLoaded = true;
+      entry.dead = false;
+    }
+    this.pendingHealth.delete(name);
+    const frame: Record<string, unknown> = { type: "respawn", health };
+    if (state && typeof state === "object") frame.state = state;
+    this.sendToName(name, frame);
+    this.broadcast({ type: "up", name });
+  }
+
+  // Death is remembered per socket while health belongs to the account, and the
+  // two can come apart: a second socket for the same account (another tab, a
+  // reconnect that overlaps the socket it replaces, a block script that healed
+  // them) restores the stored health while this socket's entry is still a
+  // corpse. The player then walks around their own screen while every peer sees
+  // a body nailed to the ground — "other players never show up", with a healthy
+  // socket. Stored health is the authority, so a pose frame from a socket the
+  // object believes is dead re-reads it (throttled per account) and stands the
+  // body back up when the two disagree. A genuinely dead account reads 0 and
+  // stays exactly as frozen as it should be.
+  private async reviveIfHealthy(name: string): Promise<void> {
+    const now = Date.now();
+    if ((this.healthRechecks.get(name) ?? 0) > now) return;
+    this.healthRechecks.set(name, now + HEALTH_RECHECK_MS);
+    let health = 0;
+    try {
+      const row = await this.env.DB.prepare(
+        `SELECT ps.health AS health FROM player_state ps
+           JOIN users u ON u.id = ps.user_id
+          WHERE u.username = ? AND ps.server_id = ?`
+      ).bind(name, this.scope()).first<{ health: number }>();
+      if (row) health = Math.max(0, Math.min(MAX_HEALTH, Number(row.health) || 0));
+    } catch (error) {
+      console.error("Health re-read failed:", error);
+      return;
+    }
+    if (health <= 0) return;
+    this.reviveAccount(name, health);
   }
 
   // First tick touch for freshly connected sockets: pull the stored health so
@@ -403,8 +591,8 @@ export class WorldLive extends DurableObject<Env> {
         const row = await this.env.DB.prepare(
           `SELECT ps.health AS health FROM player_state ps
              JOIN users u ON u.id = ps.user_id
-            WHERE u.username = ?`
-        ).bind(name).first<{ health: number }>();
+            WHERE u.username = ? AND ps.server_id = ?`
+        ).bind(name, this.scope()).first<{ health: number }>();
         if (row) {
           health = Math.max(0, Math.min(MAX_HEALTH, Number(row.health) || 0));
           if (health <= 0) {
@@ -438,10 +626,10 @@ export class WorldLive extends DurableObject<Env> {
       this.lastHealthWrite.set(name, now);
       try {
         await this.env.DB.prepare(
-          `INSERT INTO player_state(user_id,x,y,z,yaw,pitch,health)
-           SELECT id, ?, ?, ?, 0, 0, ? FROM users WHERE username = ?
-           ON CONFLICT(user_id) DO UPDATE SET health=excluded.health, updated_at=CURRENT_TIMESTAMP`
-        ).bind(0.5, heightAt(0, 0) + 2.7, 0.5, health, name).run();
+          `INSERT INTO player_state(user_id,server_id,x,y,z,yaw,pitch,health)
+           SELECT id, ?, ?, ?, ?, 0, 0, ? FROM users WHERE username = ?
+           ON CONFLICT(user_id, server_id) DO UPDATE SET health=excluded.health, updated_at=CURRENT_TIMESTAMP`
+        ).bind(this.scope(), 0.5, heightAt(0, 0) + 2.7, 0.5, health, name).run();
       } catch (error) {
         console.error("Health persist failed:", error);
       }
@@ -451,7 +639,7 @@ export class WorldLive extends DurableObject<Env> {
   // ---- client messages ------------------------------------------------------
 
   private nameOf(socket: WebSocket): string {
-    return this.presence.get(socket)?.name || "";
+    return this.identities.get(socket) || this.presence.get(socket)?.name || "";
   }
 
   private async onMessage(socket: WebSocket, data: string | ArrayBuffer): Promise<void> {
@@ -465,17 +653,25 @@ export class WorldLive extends DurableObject<Env> {
       socket.send(JSON.stringify({ type: "roster", players: [...this.presence.values()].map(wirePose) }));
     } else if (msg.type === "pose") {
       const num = (v: unknown, fallback = 0) => (typeof v === "number" && Number.isFinite(v) ? v : fallback);
-      const name = String(msg.name || "").slice(0, 32) || this.nameOf(socket) || "someone";
+      // Identity is the socket's, never the frame's: the name a client sends
+      // is decorative and collides the moment two sockets have none.
+      const name = this.nameOf(socket) || "someone";
       const entry = this.presence.get(socket);
-      // Death freezes you: a dead player's pose frames stop moving them.
-      if (entry?.dead) return;
+      // Death freezes you: a dead player's pose frames stop moving them —
+      // unless the stored health says the object is wrong about that.
+      if (entry?.dead) {
+        await this.reviveIfHealthy(name);
+        if (entry.dead) return;
+      }
       const appearance = sanitizeAppearance(msg.appearance);
       const held = sanitizeHeld(msg.held);
+      const heldItem = sanitizeHeldItem(msg.heldItem);
       const pose: Presence = {
         name, x: num(msg.x), y: num(msg.y), z: num(msg.z), yaw: num(msg.yaw),
         pitch: Math.max(-1.6, Math.min(1.6, num(msg.pitch))),
         vx: num(msg.vx), vy: num(msg.vy), vz: num(msg.vz),
         ...(held ? { held } : {}),
+        ...(heldItem ? { heldItem } : {}),
         ...(appearance ? { appearance } : {}),
         health: entry?.health ?? MAX_HEALTH,
         dead: entry?.dead ?? false,
@@ -615,8 +811,12 @@ function corsHeaders(origin: string | null): Record<string, string> {
     "Access-Control-Allow-Origin": acceptedOrigin,
     "Access-Control-Allow-Credentials": "true",
     "Access-Control-Allow-Methods": "GET,POST,PUT,DELETE,OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type,X-AC-Request",
-    "Access-Control-Max-Age": "86400",
+    // The browser stamps X-AC-Device on EVERY request (it is the private-world
+    // key), so the preflight has to carry it or no call survives.
+    "Access-Control-Allow-Headers": "Content-Type,X-AC-Request,X-AC-Device",
+    // Kept short on purpose: a browser that cached the old answer would reject a
+    // new request header for the whole lifetime of that cache.
+    "Access-Control-Max-Age": "60",
     "Vary": "Origin"
   };
 }
@@ -768,11 +968,106 @@ function validId(value: string): boolean {
 function validColour(value: string): boolean {
   return /^#[0-9a-fA-F]{6}$/.test(value);
 }
-const behaviours = new Set(["solid", "transparent", "glowing", "decorative"]);
+const behaviours = new Set(["solid", "transparent", "glowing", "decorative", "useful"]);
 const itemKinds = new Set(["block", "tool", "weapon", "food", "material"]);
 
 const validItemId = (value: string): boolean =>
   validId(value) || /^player:[a-z0-9_]+:[a-z0-9_]+:[a-z0-9_]+$/.test(value);
+
+// A server is a scoped world: every world-table row carries the id of the
+// server it belongs to. `global` — the shared world — is implicit: never a row
+// in `servers`, and the column DEFAULT, so an absent/empty server field keeps
+// the pre-servers behaviour byte-for-byte.
+const GLOBAL_SERVER = "global";
+// A free account's own-world budget; the site admin is exempt from nothing
+// here because creation is only ever for the caller themself.
+const MAX_SERVERS_PER_ACCOUNT = 3;
+
+// The ONE place that derives which server a request acts on: a `server` body
+// field on POSTs, `?server=` on GETs, absent or empty ⇒ `global`.
+function serverOf(request: Request, bodyValue?: unknown): string {
+  const raw = typeof bodyValue === "string" ? bodyValue : new URL(request.url).searchParams.get("server");
+  const value = String(raw ?? "").trim();
+  return value || GLOBAL_SERVER;
+}
+
+// Client IP: Workers stamps `cf` in production; dev (and proxied deployments)
+// leave the first X-Forwarded-For hop as the only hint.
+function clientIpOf(request: Request): string {
+  const cf = request.cf;
+  const stamped = cf && typeof cf === "object" && "clientIp" in cf && typeof cf.clientIp === "string" ? cf.clientIp : "";
+  return stamped || (request.headers.get("X-Forwarded-For") || "").split(",")[0].trim();
+}
+
+// Device secret -> stored hash. The secret never enters the database; a leaked
+// `servers` row hands out nothing usable.
+async function sha256Hex(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+// A browser cannot accept inbound connections, so `lan` visibility is defined
+// by the address, not the network stack: both ends must be RFC1918 and sit in
+// the same /24. Anything else fails closed and degrades to the private rule.
+function rfc1918Octets(value: string | null): number[] | null {
+  if (!value) return null;
+  const parts = value.trim().split(".");
+  if (parts.length !== 4 || !parts.every(part => /^\d{1,3}$/.test(part))) return null;
+  const octets = parts.map(Number);
+  if (octets.some(octet => octet > 255)) return null;
+  const [a, b] = octets;
+  const lan = a === 10 || (a === 192 && b === 168) || (a === 172 && b >= 16 && b <= 31);
+  return lan ? octets : null;
+}
+function sameLan24(ip: string, hostIp: string | null): boolean {
+  const a = rfc1918Octets(ip), b = rfc1918Octets(hostIp);
+  return !!a && !!b && a[0] === b[0] && a[1] === b[1] && a[2] === b[2];
+}
+
+type ServerRow = {
+  id: string; name: string; owner: string; visibility: string;
+  device_hash: string | null; host_ip: string | null;
+};
+
+// The join gate, shared by the world/player/time endpoints and the WS
+// upgrade. Returns null when the caller may enter, else the Response to send.
+// Invariants: `global` is always open; `public` is open; `lan` opens for the
+// creator's /24 and for everyone the private rule opens; `private` opens only
+// for the creating device (by hash), the logged-in owner, or the site admin.
+// The error token names the failing rule — clients say WHY a world is closed.
+async function gateServer(
+  request: Request,
+  env: Env,
+  server: string,
+  auth: AuthenticatedSession | null,
+  origin: string | null
+): Promise<Response | null> {
+  if (server === GLOBAL_SERVER) return null;
+  const row = await env.DB
+    .prepare("SELECT id,name,owner,visibility,device_hash,host_ip FROM servers WHERE id=?")
+    .bind(server).first<ServerRow>();
+  if (!row) return err("server", 403, origin);
+  if (row.visibility === "public") return null;
+  if (row.visibility === "lan" && sameLan24(clientIpOf(request), row.host_ip)) return null;
+  const owner = !!auth && (auth.user.username === row.owner || isAdminUser(auth.user.username));
+  const device = request.headers.get("X-AC-Device") || "";
+  if (owner || (/^[0-9a-f]{32,}$/i.test(device) && row.device_hash && await sha256Hex(device) === row.device_hash))
+    return null;
+  return err(row.visibility === "lan" ? "lan" : "private", 403, origin);
+}
+
+// The server list reports LIVE presence, not a stale DB count: only the
+// object holding a world's sockets knows who is connected to it.
+async function livePlayers(env: Env, server: string): Promise<number> {
+  try {
+    const stub = env.WORLD_LIVE.get(env.WORLD_LIVE.idFromName(server));
+    const res = await stub.fetch(new Request(`https://world-live.internal/presence?server=${encodeURIComponent(server)}`));
+    const data = await res.json() as { count?: number };
+    return Number(data?.count) || 0;
+  } catch {
+    return 0;
+  }
+}
 
 // Placement semantics (ADR 0001): declarative rules only for now; executable
 // player behaviour versions alongside these later. Malformed rules NEVER throw:
@@ -785,13 +1080,15 @@ function parseRules(raw: unknown): BlockRules {
   try {
     const value = typeof raw === "string" ? JSON.parse(raw) : raw && typeof raw === "object" ? raw : {};
     return {
-      support: supports.includes(value.support) ? value.support : "solid",
+      // Floating placement is the norm here: a block dropped into mid-air
+      // stays. Blocks that genuinely need the ground say so in rules_json.
+      support: supports.includes(value.support) ? value.support : "any",
       incompatibleWith: Array.isArray(value.incompatibleWith)
         ? value.incompatibleWith.filter((id: unknown) => typeof id === "string" && validItemId(id)).slice(0, 32)
         : []
     };
   } catch {
-    return { support: "solid", incompatibleWith: [] };
+    return { support: "any", incompatibleWith: [] };
   }
 }
 
@@ -814,13 +1111,14 @@ const cellKey = (x: number, y: number, z: number) => `${x},${y},${z}`;
 
 type EditRow = { x: number; y: number; z: number; block_id: string };
 
-// Resolve each cell's occupant: player edits override the deterministic base terrain.
-async function resolveCells(env: Env, cells: Array<[number, number, number]>): Promise<Map<string, string>> {
+// Resolve each cell's occupant in ONE world: player edits override the
+// deterministic base terrain.
+async function resolveCells(env: Env, server: string, cells: Array<[number, number, number]>): Promise<Map<string, string>> {
   const where = cells.map(() => "(x=? AND y=? AND z=?)").join(" OR ");
-  const params: number[] = [];
+  const params: (string | number)[] = [server];
   for (const [x, y, z] of cells) params.push(x, y, z);
   const { results } = await env.DB
-    .prepare(`SELECT x,y,z,block_id FROM world_edits WHERE ${where}`)
+    .prepare(`SELECT x,y,z,block_id FROM world_edits WHERE server_id=? AND (${where})`)
     .bind(...params)
     .all<EditRow>();
   const overrides = new Map(results.map(row => [cellKey(row.x, row.y, row.z), row.block_id]));
@@ -832,14 +1130,17 @@ async function resolveCells(env: Env, cells: Array<[number, number, number]>): P
   return resolved;
 }
 
-// Fan one frame out to every connected player through the WorldLive object.
-async function publishFrame(env: Env, frame: Record<string, unknown>): Promise<void> {
+// Fan one frame out to the sockets of ONE world: the stub is addressed BY
+// SERVER, so an edit in one world can only ever reach that world's players.
+// The wrapper body carries the id for the object's own binding; only `frame`
+// is broadcast, so `server` never leaks into a client's frame parser.
+async function publishFrame(env: Env, server: string, frame: Record<string, unknown>): Promise<void> {
   try {
-    const stub = env.WORLD_LIVE.get(env.WORLD_LIVE.idFromName("world"));
+    const stub = env.WORLD_LIVE.get(env.WORLD_LIVE.idFromName(server));
     await stub.fetch(
       new Request("https://world-live.internal/publish", {
         method: "POST",
-        body: JSON.stringify(frame)
+        body: JSON.stringify({ server, frame })
       })
     );
   } catch (error) {
@@ -847,8 +1148,8 @@ async function publishFrame(env: Env, frame: Record<string, unknown>): Promise<v
   }
 }
 
-async function publishEdit(env: Env, x: number, y: number, z: number, blockId: string): Promise<void> {
-  await publishFrame(env, { type: "edit", x, y, z, block_id: blockId });
+async function publishEdit(env: Env, server: string, x: number, y: number, z: number, blockId: string): Promise<void> {
+  await publishFrame(env, server, { type: "edit", x, y, z, block_id: blockId });
 }
 
 // `world_edits` is the whole truth about the world; the catch-up log, the
@@ -858,36 +1159,37 @@ async function publishEdit(env: Env, x: number, y: number, z: number, blockId: s
 // is exactly "the world says a block is here, D1 says it isn't". Anything whose
 // cell is gone is stale by construction, so it gets pruned.
 const ORPHAN_COUNT = (table: string) =>
-  `SELECT COUNT(*) AS n FROM ${table} w WHERE NOT EXISTS (SELECT 1 FROM world_edits e WHERE e.x=w.x AND e.y=w.y AND e.z=w.z)`;
+  `SELECT COUNT(*) AS n FROM ${table} w WHERE w.server_id=? AND NOT EXISTS (SELECT 1 FROM world_edits e WHERE e.server_id=w.server_id AND e.x=w.x AND e.y=w.y AND e.z=w.z)`;
 const ORPHAN_PRUNE = (table: string) =>
-  `DELETE FROM ${table} WHERE NOT EXISTS (SELECT 1 FROM world_edits e WHERE e.x=${table}.x AND e.y=${table}.y AND e.z=${table}.z)`;
+  `DELETE FROM ${table} WHERE server_id=? AND NOT EXISTS (SELECT 1 FROM world_edits e WHERE e.server_id=${table}.server_id AND e.x=${table}.x AND e.y=${table}.y AND e.z=${table}.z)`;
 
-async function pruneOrphanWorldRows(env: Env): Promise<{ log: number; state: number; beams: number; inv: number }> {
+async function pruneOrphanWorldRows(env: Env, server: string): Promise<{ log: number; state: number; beams: number; inv: number }> {
   const [log, state, beams, inv] = await Promise.all([
-    env.DB.prepare(ORPHAN_COUNT("world_log")).first<{ n: number }>(),
-    env.DB.prepare(ORPHAN_COUNT("block_state")).first<{ n: number }>(),
-    env.DB.prepare(ORPHAN_COUNT("block_beams")).first<{ n: number }>(),
-    env.DB.prepare(ORPHAN_COUNT("block_inventory")).first<{ n: number }>()
+    env.DB.prepare(ORPHAN_COUNT("world_log")).bind(server).first<{ n: number }>(),
+    env.DB.prepare(ORPHAN_COUNT("block_state")).bind(server).first<{ n: number }>(),
+    env.DB.prepare(ORPHAN_COUNT("block_beams")).bind(server).first<{ n: number }>(),
+    env.DB.prepare(ORPHAN_COUNT("block_inventory")).bind(server).first<{ n: number }>()
   ]);
   await env.DB.batch([
-    env.DB.prepare(ORPHAN_PRUNE("world_log")),
-    env.DB.prepare(ORPHAN_PRUNE("block_state")),
-    env.DB.prepare(ORPHAN_PRUNE("block_beams")),
-    env.DB.prepare(ORPHAN_PRUNE("block_inventory"))
+    env.DB.prepare(ORPHAN_PRUNE("world_log")).bind(server),
+    env.DB.prepare(ORPHAN_PRUNE("block_state")).bind(server),
+    env.DB.prepare(ORPHAN_PRUNE("block_beams")).bind(server),
+    env.DB.prepare(ORPHAN_PRUNE("block_inventory")).bind(server)
   ]);
   return { log: log?.n ?? 0, state: state?.n ?? 0, beams: beams?.n ?? 0, inv: inv?.n ?? 0 };
 }
 
 // Tell the live object about a health change made over REST (respawn, eat) so
 // its in-memory presence agrees and live sockets update. If the object is not
-// running this is a harmless no-op.
-async function notifyLive(env: Env, endpoint: "respawn" | "health" | "move", payload: unknown): Promise<void> {
+// running this is a harmless no-op. The payload carries the server id both to
+// address the right instance and to bind it after eviction.
+async function notifyLive(env: Env, server: string, endpoint: "respawn" | "health" | "move" | "clock", payload: Record<string, unknown>): Promise<void> {
   try {
-    const stub = env.WORLD_LIVE.get(env.WORLD_LIVE.idFromName("world"));
+    const stub = env.WORLD_LIVE.get(env.WORLD_LIVE.idFromName(server));
     await stub.fetch(
       new Request(`https://world-live.internal/${endpoint}`, {
         method: "POST",
-        body: JSON.stringify(payload)
+        body: JSON.stringify({ ...payload, server })
       })
     );
   } catch (error) {
@@ -915,7 +1217,8 @@ function worldCoords(data: { x: unknown; y: unknown; z: unknown }): { x: number;
 type BlockRow = {
   id: string; name: string; creator: string; hardness: number; light: number;
   colour: string; behaviour: string; rules_json: string; is_builtin: number;
-  texture: string | null; model: string | null; script: string | null;
+  texture: string | null; texture_top: string | null; texture_bottom: string | null;
+  model: string | null; script: string | null;
 };
 
 // The voxel models the renderer actually ships (vlox hardcodes the list; an
@@ -955,12 +1258,13 @@ function sanitizeScript(raw: unknown): { value: string | null; error: string | n
 
 async function listBlocks(env: Env): Promise<unknown[]> {
   const { results } = await env.DB.prepare(
-    "SELECT id,name,creator_name AS creator,hardness,light,colour,behaviour,rules_json,is_builtin,texture,model,script FROM blocks ORDER BY is_builtin DESC,name LIMIT 500"
+    "SELECT id,name,creator_name AS creator,hardness,light,colour,behaviour,rules_json,is_builtin,texture,texture_top,texture_bottom,model,script FROM blocks ORDER BY is_builtin DESC,name LIMIT 500"
   ).all<BlockRow>();
   return results.map(row => ({
     id: row.id, name: row.name, creator: row.creator, hardness: row.hardness, light: row.light,
     colour: row.colour, behaviour: row.behaviour, is_builtin: row.is_builtin, rules: parseRules(row.rules_json),
-    texture: row.texture ?? null, model: row.model ?? null, script: row.script ?? null
+    texture: row.texture ?? null, texture_top: row.texture_top ?? null, texture_bottom: row.texture_bottom ?? null,
+    model: row.model ?? null, script: row.script ?? null
   }));
 }
 
@@ -1044,7 +1348,12 @@ type LogRow = { seq: number; x: number; y: number; z: number; block_id: string }
 async function handlePlace(request: Request, env: Env, origin: string | null): Promise<Response> {
   const auth = await authenticate(request, env);
   if (!auth) return err("Log in first.", 401, origin);
-  const data = await body<{ x: unknown; y: unknown; z: unknown; item_id: unknown }>(request);
+  const data = await body<{ x: unknown; y: unknown; z: unknown; item_id: unknown; server?: unknown }>(request);
+  const server = serverOf(request, data.server);
+  // Gate before anything is read or written: a stranger never even learns
+  // whether the cell is occupied in someone else's world.
+  const denied = await gateServer(request, env, server, auth, origin);
+  if (denied) return denied;
   const coords = worldCoords(data);
   if (!coords) return err(`Coordinates must be integers (x/z within ±1000000, y within 0..${WORLD_Y - 1}).`, 400, origin);
   const { x, y, z } = coords;
@@ -1066,7 +1375,7 @@ async function handlePlace(request: Request, env: Env, origin: string | null): P
   const neighbours: Array<[number, number, number]> = [
     [x - 1, y, z], [x + 1, y, z], [x, y, z - 1], [x, y, z + 1], [x, y - 1, z], [x, y + 1, z]
   ];
-  const cells = await resolveCells(env, [[x, y, z], ...neighbours]);
+  const cells = await resolveCells(env, server, [[x, y, z], ...neighbours]);
 
   if (cells.get(cellKey(x, y, z)) !== "air")
     return json({ error: "That cell is already occupied.", code: "occupied" }, 409, origin);
@@ -1091,25 +1400,29 @@ async function handlePlace(request: Request, env: Env, origin: string | null): P
 
   await env.DB.batch([
     env.DB.prepare(
-      "INSERT INTO world_edits(x,y,z,block_id,placed_by) VALUES(?,?,?,?,?) ON CONFLICT(x,y,z) DO UPDATE SET block_id=excluded.block_id, placed_by=excluded.placed_by, created_at=CURRENT_TIMESTAMP"
-    ).bind(x, y, z, blockId, auth.user.id),
-    env.DB.prepare("INSERT INTO world_log(x,y,z,block_id) VALUES(?,?,?,?)").bind(x, y, z, blockId),
-    // The log is a catch-up queue, not an archive: keep only the newest edits.
-    env.DB.prepare("DELETE FROM world_log WHERE seq <= (SELECT MAX(seq) - ? FROM world_log)").bind(WORLD_LOG_KEEP)
+      "INSERT INTO world_edits(server_id,x,y,z,block_id,placed_by) VALUES(?,?,?,?,?,?) ON CONFLICT(server_id,x,y,z) DO UPDATE SET block_id=excluded.block_id, placed_by=excluded.placed_by, created_at=CURRENT_TIMESTAMP"
+    ).bind(server, x, y, z, blockId, auth.user.id),
+    env.DB.prepare("INSERT INTO world_log(server_id,x,y,z,block_id) VALUES(?,?,?,?,?)").bind(server, x, y, z, blockId),
+    // The log is a catch-up queue, not an archive: keep only the newest edits
+    // of THIS world — another server's busy log must not evict this one's.
+    env.DB.prepare("DELETE FROM world_log WHERE server_id=? AND seq <= (SELECT MAX(seq) - ? FROM world_log WHERE server_id=?)").bind(server, WORLD_LOG_KEEP, server)
   ]);
-  await publishEdit(env, x, y, z, blockId);
+  await publishEdit(env, server, x, y, z, blockId);
   return json({ ok: true, x, y, z, id: blockId }, 201, origin);
 }
 
 async function handleBreak(request: Request, env: Env, origin: string | null): Promise<Response> {
   const auth = await authenticate(request, env);
   if (!auth) return err("Log in first.", 401, origin);
-  const data = await body<{ x: unknown; y: unknown; z: unknown }>(request);
+  const data = await body<{ x: unknown; y: unknown; z: unknown; server?: unknown }>(request);
+  const server = serverOf(request, data.server);
+  const denied = await gateServer(request, env, server, auth, origin);
+  if (denied) return denied;
   const coords = worldCoords(data);
   if (!coords) return err(`Coordinates must be integers (x/z within ±1000000, y within 0..${WORLD_Y - 1}).`, 400, origin);
   const { x, y, z } = coords;
 
-  const cells = await resolveCells(env, [[x, y, z]]);
+  const cells = await resolveCells(env, server, [[x, y, z]]);
   const current = cells.get(cellKey(x, y, z))!;
   if (current === "air") return json({ error: "Nothing to break there.", code: "empty" }, 409, origin);
   if (current === "builtin:bedrock")
@@ -1138,14 +1451,14 @@ async function handleBreak(request: Request, env: Env, origin: string | null): P
   let run: ScriptOutcome | null = null;
   let contents: { item: string; qty: number }[];
   if (scriptRow?.script) {
-    const rows = await env.DB.prepare("SELECT key,value FROM block_state WHERE x=? AND y=? AND z=?")
-      .bind(x, y, z).all<{ key: string; value: string | null }>();
+    const rows = await env.DB.prepare("SELECT key,value FROM block_state WHERE server_id=? AND x=? AND y=? AND z=?")
+      .bind(server, x, y, z).all<{ key: string; value: string | null }>();
     const values = new Map<string, string | number | null>();
     for (const row of rows.results) values.set(row.key, stateValue(row.value));
     const [inv, stacks, pos] = await Promise.all([
-      loadBlockInventory(env, x, y, z),
+      loadBlockInventory(env, server, x, y, z),
       loadStacks(env, auth.user.id),
-      loadPlayerPosition(env, auth.user.id)
+      loadPlayerPosition(env, server, auth.user.id)
     ]);
     run = runBlockScript(
       scriptRow.script,
@@ -1162,11 +1475,11 @@ async function handleBreak(request: Request, env: Env, origin: string | null): P
       ? run.stored.filter((s) => s.qty > 0)
       : [...inv].map(([item, qty]) => ({ item, qty }));
   } else {
-    contents = [...await loadBlockInventory(env, x, y, z)].map(([item, qty]) => ({ item, qty }));
+    contents = [...await loadBlockInventory(env, server, x, y, z)].map(([item, qty]) => ({ item, qty }));
   }
 
-  const beam = await env.DB.prepare("SELECT colour FROM block_beams WHERE x=? AND y=? AND z=?")
-    .bind(x, y, z).first<{ colour: string }>();
+  const beam = await env.DB.prepare("SELECT colour FROM block_beams WHERE server_id=? AND x=? AND y=? AND z=?")
+    .bind(server, x, y, z).first<{ colour: string }>();
 
   // One write per item for everything the breaker ends up holding — the ordinary
   // drop, whatever the hook handed over, and the contents of the cell — so two
@@ -1180,19 +1493,19 @@ async function handleBreak(request: Request, env: Env, origin: string | null): P
       run?.takes ?? []
     ),
     env.DB.prepare(
-      "INSERT INTO world_edits(x,y,z,block_id,placed_by) VALUES(?,?,?,?,?) ON CONFLICT(x,y,z) DO UPDATE SET block_id='air', placed_by=excluded.placed_by, created_at=CURRENT_TIMESTAMP"
-    ).bind(x, y, z, "air", auth.user.id),
-    env.DB.prepare("INSERT INTO world_log(x,y,z,block_id) VALUES(?,?,?,?)").bind(x, y, z, "air"),
-    env.DB.prepare("DELETE FROM world_log WHERE seq <= (SELECT MAX(seq) - ? FROM world_log)").bind(WORLD_LOG_KEEP),
-    env.DB.prepare("DELETE FROM block_state WHERE x=? AND y=? AND z=?").bind(x, y, z),
-    env.DB.prepare("DELETE FROM block_beams WHERE x=? AND y=? AND z=?").bind(x, y, z),
-    env.DB.prepare("DELETE FROM block_inventory WHERE x=? AND y=? AND z=?").bind(x, y, z)
+      "INSERT INTO world_edits(server_id,x,y,z,block_id,placed_by) VALUES(?,?,?,?,?,?) ON CONFLICT(server_id,x,y,z) DO UPDATE SET block_id='air', placed_by=excluded.placed_by, created_at=CURRENT_TIMESTAMP"
+    ).bind(server, x, y, z, "air", auth.user.id),
+    env.DB.prepare("INSERT INTO world_log(server_id,x,y,z,block_id) VALUES(?,?,?,?,?)").bind(server, x, y, z, "air"),
+    env.DB.prepare("DELETE FROM world_log WHERE server_id=? AND seq <= (SELECT MAX(seq) - ? FROM world_log WHERE server_id=?)").bind(server, WORLD_LOG_KEEP, server),
+    env.DB.prepare("DELETE FROM block_state WHERE server_id=? AND x=? AND y=? AND z=?").bind(server, x, y, z),
+    env.DB.prepare("DELETE FROM block_beams WHERE server_id=? AND x=? AND y=? AND z=?").bind(server, x, y, z),
+    env.DB.prepare("DELETE FROM block_inventory WHERE server_id=? AND x=? AND y=? AND z=?").bind(server, x, y, z)
   ]);
-  await publishEdit(env, x, y, z, "air");
-  if (beam) await publishFrame(env, { type: "beam", x, y, z, colour: null });
+  await publishEdit(env, server, x, y, z, "air");
+  if (beam) await publishFrame(env, server, { type: "beam", x, y, z, colour: null });
 
   // A hook's teleports and anchors belong to the player, not the dying cell.
-  if (run) await applyScriptMoves(env, auth.user.id, auth.user.username, run.moves);
+  if (run) await applyScriptMoves(env, server, auth.user.id, auth.user.username, run.moves);
 
   return json({ ok: true, x, y, z, dropped: dropId, contents, toasts: run?.toasts ?? [] }, 200, origin);
 }
@@ -1210,19 +1523,26 @@ async function handleWorldResync(request: Request, env: Env, origin: string | nu
   const auth = await authenticate(request, env);
   if (!auth) return err("Log in first.", 401, origin);
   if (!isAdminUser(auth.user.username)) return err("Only the admin account can resync the world.", 403, origin);
+  // Repair is per world now: an admin healing a stray overlay in one server
+  // must not replay (or prune) another account's world.
+  const data = await body<{ server?: unknown }>(request);
+  const server = serverOf(request, data.server);
+  const denied = await gateServer(request, env, server, auth, origin);
+  if (denied) return denied;
 
-  const cleared = await pruneOrphanWorldRows(env);
+  const cleared = await pruneOrphanWorldRows(env, server);
   const { results } = await env.DB
-    .prepare("SELECT x,y,z,block_id FROM world_edits ORDER BY x,y,z LIMIT ?")
-    .bind(RESYNC_MAX_CELLS + 1).all<EditRow>();
+    .prepare("SELECT x,y,z,block_id FROM world_edits WHERE server_id=? ORDER BY x,y,z LIMIT ?")
+    .bind(server, RESYNC_MAX_CELLS + 1).all<EditRow>();
   const truncated = results.length > RESYNC_MAX_CELLS;
   const cells = results.slice(0, RESYNC_MAX_CELLS);
-  const beams = await listBeams(env);
-  const stub = env.WORLD_LIVE.get(env.WORLD_LIVE.idFromName("world"));
+  const beams = await listBeams(env, server);
+  const stub = env.WORLD_LIVE.get(env.WORLD_LIVE.idFromName(server));
   for (let i = 0; i < Math.max(cells.length, 1); i += RESYNC_CHUNK) {
     await stub.fetch(new Request("https://world-live.internal/replay", {
       method: "POST",
       body: JSON.stringify({
+        server,
         cells: cells.slice(i, i + RESYNC_CHUNK),
         beams: i === 0 ? beams : [],
         announce: i + RESYNC_CHUNK >= cells.length
@@ -1247,10 +1567,10 @@ async function handleWorldResync(request: Request, env: Env, origin: string | nu
 
 type BeamRow = { x: number; y: number; z: number; colour: string };
 
-async function listBeams(env: Env): Promise<BeamRow[]> {
+async function listBeams(env: Env, server: string): Promise<BeamRow[]> {
   const { results } = await env.DB.prepare(
-    "SELECT x,y,z,colour FROM block_beams ORDER BY x,y,z LIMIT 400"
-  ).all<BeamRow>();
+    "SELECT x,y,z,colour FROM block_beams WHERE server_id=? ORDER BY x,y,z LIMIT 400"
+  ).bind(server).all<BeamRow>();
   return results;
 }
 
@@ -1266,10 +1586,10 @@ function stateValue(raw: string | null): string | number | null {
 // preloaded before the run and flushed by the caller afterwards, in the same
 // batch as everything else that request writes.
 
-async function loadBlockInventory(env: Env, x: number, y: number, z: number): Promise<Map<string, number>> {
+async function loadBlockInventory(env: Env, server: string, x: number, y: number, z: number): Promise<Map<string, number>> {
   const { results } = await env.DB.prepare(
-    "SELECT item_id,quantity FROM block_inventory WHERE x=? AND y=? AND z=?"
-  ).bind(x, y, z).all<{ item_id: string; quantity: number }>();
+    "SELECT item_id,quantity FROM block_inventory WHERE server_id=? AND x=? AND y=? AND z=?"
+  ).bind(server, x, y, z).all<{ item_id: string; quantity: number }>();
   const inv = new Map<string, number>();
   for (const row of results) inv.set(row.item_id, Math.max(0, Math.min(MAX_STACK, Number(row.quantity))));
   return inv;
@@ -1283,8 +1603,8 @@ async function loadStacks(env: Env, userId: string): Promise<Map<string, number>
   return stacks;
 }
 
-async function loadPlayerPosition(env: Env, userId: string): Promise<{ x: number; y: number; z: number } | null> {
-  const row = await env.DB.prepare("SELECT x,y,z FROM player_state WHERE user_id=?").bind(userId)
+async function loadPlayerPosition(env: Env, server: string, userId: string): Promise<{ x: number; y: number; z: number } | null> {
+  const row = await env.DB.prepare("SELECT x,y,z FROM player_state WHERE user_id=? AND server_id=?").bind(userId, server)
     .first<{ x: number; y: number; z: number }>();
   return row ? { x: Number(row.x), y: Number(row.y), z: Number(row.z) } : null;
 }
@@ -1292,6 +1612,7 @@ async function loadPlayerPosition(env: Env, userId: string): Promise<{ x: number
 // The cell's final store as written statements: quantity 0 means the row goes.
 function storeStatements(
   env: Env,
+  server: string,
   x: number, y: number, z: number,
   stored: { item: string; qty: number }[]
 ): D1PreparedStatement[] {
@@ -1299,12 +1620,12 @@ function storeStatements(
   for (const s of stored) {
     if (s.qty <= 0) {
       stmts.push(env.DB.prepare(
-        "DELETE FROM block_inventory WHERE x=? AND y=? AND z=? AND item_id=?"
-      ).bind(x, y, z, s.item));
+        "DELETE FROM block_inventory WHERE server_id=? AND x=? AND y=? AND z=? AND item_id=?"
+      ).bind(server, x, y, z, s.item));
     } else {
       stmts.push(env.DB.prepare(
-        "INSERT INTO block_inventory(x,y,z,item_id,quantity,updated_at) VALUES(?,?,?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(x,y,z,item_id) DO UPDATE SET quantity=excluded.quantity, updated_at=CURRENT_TIMESTAMP"
-      ).bind(x, y, z, s.item, s.qty));
+        "INSERT INTO block_inventory(server_id,x,y,z,item_id,quantity,updated_at) VALUES(?,?,?,?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(server_id,x,y,z,item_id) DO UPDATE SET quantity=excluded.quantity, updated_at=CURRENT_TIMESTAMP"
+      ).bind(server, x, y, z, s.item, s.qty));
     }
   }
   return stmts;
@@ -1340,6 +1661,7 @@ function stackStatements(
 // must hear about a move, or its cached presence would push the player back.
 async function applyScriptMoves(
   env: Env,
+  server: string,
   userId: string,
   username: string,
   moves: { kind: "position" | "respawn"; x: number; y: number; z: number }[]
@@ -1349,33 +1671,36 @@ async function applyScriptMoves(
       // The insert side has to be a complete row: x/y/z are NOT NULL, and
       // SQLite checks them even when the row already exists and the update side
       // runs. Only a player who has never moved takes these defaults.
-      const fresh = defaultSpawnState();
+      const fresh = defaultSpawnState(username);
       await env.DB.prepare(
-        "INSERT INTO player_state(user_id,x,y,z,yaw,pitch,health,spawn_x,spawn_y,spawn_z)" +
-        " SELECT id,?,?,?,0,0,20,?,?,? FROM users WHERE id=?" +
-        " ON CONFLICT(user_id) DO UPDATE SET spawn_x=excluded.spawn_x, spawn_y=excluded.spawn_y, spawn_z=excluded.spawn_z, updated_at=CURRENT_TIMESTAMP"
-      ).bind(fresh.x, fresh.y, fresh.z, m.x, m.y, m.z, userId).run();
+        "INSERT INTO player_state(user_id,server_id,x,y,z,yaw,pitch,health,spawn_x,spawn_y,spawn_z)" +
+        " SELECT id,?,?,?,?,0,0,20,?,?,? FROM users WHERE id=?" +
+        " ON CONFLICT(user_id, server_id) DO UPDATE SET spawn_x=excluded.spawn_x, spawn_y=excluded.spawn_y, spawn_z=excluded.spawn_z, updated_at=CURRENT_TIMESTAMP"
+      ).bind(server, fresh.x, fresh.y, fresh.z, m.x, m.y, m.z, userId).run();
       continue;
     }
     await env.DB.prepare(
-      "INSERT INTO player_state(user_id,x,y,z,yaw,pitch,health) SELECT id,?,?,?,0,0,? FROM users WHERE id=?" +
-      " ON CONFLICT(user_id) DO UPDATE SET x=excluded.x, y=excluded.y, z=excluded.z, yaw=0, pitch=0, updated_at=CURRENT_TIMESTAMP"
-    ).bind(m.x, m.y, m.z, MAX_HEALTH, userId).run();
-    await notifyLive(env, "move", { name: username, x: m.x, y: m.y, z: m.z });
+      "INSERT INTO player_state(user_id,server_id,x,y,z,yaw,pitch,health) SELECT id,?,?,?,?,0,0,? FROM users WHERE id=?" +
+      " ON CONFLICT(user_id, server_id) DO UPDATE SET x=excluded.x, y=excluded.y, z=excluded.z, yaw=0, pitch=0, updated_at=CURRENT_TIMESTAMP"
+    ).bind(server, m.x, m.y, m.z, MAX_HEALTH, userId).run();
+    await notifyLive(env, server, "move", { name: username, x: m.x, y: m.y, z: m.z });
   }
 }
 
 async function handleBlockInteract(request: Request, env: Env, origin: string | null): Promise<Response> {
   const auth = await authenticate(request, env);
   if (!auth) return err("Log in first.", 401, origin);
-  const data = await body<{ x: unknown; y: unknown; z: unknown; key?: unknown }>(request);
+  const data = await body<{ x: unknown; y: unknown; z: unknown; key?: unknown; server?: unknown }>(request);
+  const server = serverOf(request, data.server);
+  const denied = await gateServer(request, env, server, auth, origin);
+  if (denied) return denied;
   const coords = worldCoords(data);
   if (!coords) return err(`Coordinates must be integers (x/z within ±${WORLD_COORD_LIMIT}, y within 0..${WORLD_Y - 1}).`, 400, origin);
   const { x, y, z } = coords;
   // No key means "open the block's menu"; a key means "choose this option".
   const key = typeof data.key === "string" && data.key ? data.key.slice(0, 32) : undefined;
 
-  const cells = await resolveCells(env, [[x, y, z]]);
+  const cells = await resolveCells(env, server, [[x, y, z]]);
   const blockId = cells.get(cellKey(x, y, z))!;
   if (blockId === "air") return json({ ok: false, reason: "empty" }, 200, origin);
   const block = await env.DB.prepare("SELECT id,name,script FROM blocks WHERE id=?")
@@ -1384,8 +1709,8 @@ async function handleBlockInteract(request: Request, env: Env, origin: string | 
 
   // The interpreter reads and writes state synchronously, so the cell's rows
   // are preloaded and the writes are flushed afterwards.
-  const stored = await env.DB.prepare("SELECT key,value FROM block_state WHERE x=? AND y=? AND z=?")
-    .bind(x, y, z).all<{ key: string; value: string | null }>();
+  const stored = await env.DB.prepare("SELECT key,value FROM block_state WHERE server_id=? AND x=? AND y=? AND z=?")
+    .bind(server, x, y, z).all<{ key: string; value: string | null }>();
   const values = new Map<string, string | number | null>();
   for (const row of stored.results) values.set(row.key, stateValue(row.value));
   const writes = new Map<string, string | number | null>();
@@ -1394,15 +1719,15 @@ async function handleBlockInteract(request: Request, env: Env, origin: string | 
     set: (k, v) => { writes.set(k, v); values.set(k, v); },
   };
 
-  const before = await env.DB.prepare("SELECT colour FROM block_beams WHERE x=? AND y=? AND z=?")
-    .bind(x, y, z).first<{ colour: string }>();
+  const before = await env.DB.prepare("SELECT colour FROM block_beams WHERE server_id=? AND x=? AND y=? AND z=?")
+    .bind(server, x, y, z).first<{ colour: string }>();
 
   // Same preload/flush shape for the rest of the world the script can touch:
   // the acting player's position and stacks, and this cell's own store.
   const [inv, stacks, pos] = await Promise.all([
-    loadBlockInventory(env, x, y, z),
+    loadBlockInventory(env, server, x, y, z),
     loadStacks(env, auth.user.id),
-    loadPlayerPosition(env, auth.user.id)
+    loadPlayerPosition(env, server, auth.user.id)
   ]);
 
   const outcome = runBlockScript(
@@ -1421,30 +1746,31 @@ async function handleBlockInteract(request: Request, env: Env, origin: string | 
 
   const flush: D1PreparedStatement[] = [];
   for (const [k, v] of writes) {
-    if (v === null) flush.push(env.DB.prepare("DELETE FROM block_state WHERE x=? AND y=? AND z=? AND key=?").bind(x, y, z, k));
+    if (v === null) flush.push(env.DB.prepare("DELETE FROM block_state WHERE server_id=? AND x=? AND y=? AND z=? AND key=?").bind(server, x, y, z, k));
     else flush.push(env.DB.prepare(
-      "INSERT INTO block_state(x,y,z,key,value,updated_at) VALUES(?,?,?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(x,y,z,key) DO UPDATE SET value=excluded.value, updated_at=CURRENT_TIMESTAMP"
-    ).bind(x, y, z, k, String(v)));
+      "INSERT INTO block_state(server_id,x,y,z,key,value,updated_at) VALUES(?,?,?,?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(server_id,x,y,z,key) DO UPDATE SET value=excluded.value, updated_at=CURRENT_TIMESTAMP"
+    ).bind(server, x, y, z, k, String(v)));
   }
-  flush.push(...storeStatements(env, x, y, z, outcome.stored));
+  flush.push(...storeStatements(env, server, x, y, z, outcome.stored));
   flush.push(...stackStatements(env, auth.user.id, outcome.gives, outcome.takes));
-  flush.push(env.DB.prepare("DELETE FROM block_beams WHERE x=? AND y=? AND z=?").bind(x, y, z));
+  flush.push(env.DB.prepare("DELETE FROM block_beams WHERE server_id=? AND x=? AND y=? AND z=?").bind(server, x, y, z));
   const beams: string[] = [];
   for (const beam of outcome.beams) {
     if (!/^#[0-9a-f]{6}$/i.test(beam.colour)) continue;
-    flush.push(env.DB.prepare("INSERT INTO block_beams(x,y,z,colour,updated_at) VALUES(?,?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(x,y,z) DO UPDATE SET colour=excluded.colour, updated_at=CURRENT_TIMESTAMP")
-      .bind(x, y, z, beam.colour));
+    flush.push(env.DB.prepare("INSERT INTO block_beams(server_id,x,y,z,colour,updated_at) VALUES(?,?,?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(server_id,x,y,z) DO UPDATE SET colour=excluded.colour, updated_at=CURRENT_TIMESTAMP")
+      .bind(server, x, y, z, beam.colour));
     beams.push(beam.colour);
   }
   await env.DB.batch(flush);
 
-  // Live light: every connected client paints (or removes) this cell's column.
-  if (beams.length) await publishFrame(env, { type: "beam", x, y, z, colour: beams[beams.length - 1] });
-  else if (before) await publishFrame(env, { type: "beam", x, y, z, colour: null });
+  // Live light: every client watching THIS world paints (or removes) the cell's
+  // column.
+  if (beams.length) await publishFrame(env, server, { type: "beam", x, y, z, colour: beams[beams.length - 1] });
+  else if (before) await publishFrame(env, server, { type: "beam", x, y, z, colour: null });
 
   // The player's own world moved: write it and let the live object know, or the
   // next presence frame would shove them back to where they were.
-  await applyScriptMoves(env, auth.user.id, auth.user.username, outcome.moves);
+  await applyScriptMoves(env, server, auth.user.id, auth.user.username, outcome.moves);
 
   return json({
     ok: true,
@@ -1467,10 +1793,13 @@ const DEFAULT_APPEARANCE: AppearanceColours = { body_colour: "#3b6ea5", head_col
 async function handleGetPlayerState(request: Request, env: Env, origin: string | null): Promise<Response> {
   const auth = await authenticate(request, env);
   if (!auth) return err("Log in first.", 401, origin);
+  const server = serverOf(request);
+  const denied = await gateServer(request, env, server, auth, origin);
+  if (denied) return denied;
   const [row, appearance] = await Promise.all([
     env.DB
-      .prepare("SELECT x, y, z, yaw, pitch, health FROM player_state WHERE user_id=?")
-      .bind(auth.user.id)
+      .prepare("SELECT x, y, z, yaw, pitch, health FROM player_state WHERE user_id=? AND server_id=?")
+      .bind(auth.user.id, server)
       .first<{ x: number; y: number; z: number; yaw: number; pitch: number; health: number }>(),
     env.DB
       .prepare("SELECT body_colour, head_colour, accent_colour, eye_colour FROM player_appearance WHERE user_id=?")
@@ -1488,7 +1817,10 @@ async function handleGetPlayerState(request: Request, env: Env, origin: string |
 async function handlePutPlayerState(request: Request, env: Env, origin: string | null): Promise<Response> {
   const auth = await authenticate(request, env);
   if (!auth) return err("Log in first.", 401, origin);
-  const data = await body<{ x: unknown; y: unknown; z: unknown; yaw: unknown; pitch: unknown }>(request);
+  const data = await body<{ x: unknown; y: unknown; z: unknown; yaw: unknown; pitch: unknown; server?: unknown }>(request);
+  const server = serverOf(request, data.server);
+  const denied = await gateServer(request, env, server, auth, origin);
+  if (denied) return denied;
   const n = (v: unknown): number | null => (typeof v === "number" && Number.isFinite(v) ? v : null);
   const x = n(data.x), y = n(data.y), z = n(data.z), yaw = n(data.yaw), pitch = n(data.pitch);
   if (x === null || y === null || z === null || yaw === null || pitch === null)
@@ -1496,8 +1828,8 @@ async function handlePutPlayerState(request: Request, env: Env, origin: string |
   if (Math.abs(x) > 1e6 || Math.abs(z) > 1e6 || y < 0 || y > 256)
     return err("Position is outside the world.", 400, origin);
   await env.DB.prepare(
-    "INSERT INTO player_state(user_id,x,y,z,yaw,pitch) VALUES(?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET x=excluded.x, y=excluded.y, z=excluded.z, yaw=excluded.yaw, pitch=excluded.pitch, updated_at=CURRENT_TIMESTAMP"
-  ).bind(auth.user.id, x, y, z, yaw, pitch).run();
+    "INSERT INTO player_state(user_id,server_id,x,y,z,yaw,pitch) VALUES(?,?,?,?,?,?,?) ON CONFLICT(user_id, server_id) DO UPDATE SET x=excluded.x, y=excluded.y, z=excluded.z, yaw=excluded.yaw, pitch=excluded.pitch, updated_at=CURRENT_TIMESTAMP"
+  ).bind(auth.user.id, server, x, y, z, yaw, pitch).run();
   return json({ ok: true }, 200, origin);
 }
 
@@ -1571,17 +1903,42 @@ async function handleCraft(request: Request, env: Env, origin: string | null): P
 // The default spawn handleGetPlayerState falls back to: a stateless player
 // stands on the terrain surface at the world origin column — x/z 0.5, y =
 // surface top + eye height (EYE 1.7 in the client camera).
-function defaultSpawnState(): { x: number; y: number; z: number; yaw: number; pitch: number } {
-  return { x: 0.5, y: heightAt(0, 0) + 1 + 1.7, z: 0.5, yaw: 0, pitch: 0 };
+// Every account that has never moved, and every anchor-less respawn, used to
+// wake up on the same cell - two players who joined together stood inside each
+// other's camera. The column comes from the account name and only where the
+// ground is as flat as the origin's; the client's ring in
+// `frontend/dve/src/main.js` is the same table, so both sides spread the same
+// way.
+const SPAWN_SPREAD: [number, number][] = [[0, 0], [3, 0], [-3, 0], [0, 3], [0, -3], [2, 2], [-2, 2],
+  [2, -2], [-2, -2], [5, 0], [-5, 0], [0, 5], [0, -5], [4, 3], [-4, 3], [4, -3], [-4, -3], [7, 0], [-7, 0], [0, 7], [0, -7]];
+
+function spawnColumn(username: string): { x: number; z: number } {
+  let h = 2166136261;
+  for (let i = 0; i < username.length; i++) { h ^= username.charCodeAt(i); h = Math.imul(h, 16777619); }
+  const base = heightAt(0, 0);
+  for (let k = 0; k < SPAWN_SPREAD.length; k++) {
+    const c = SPAWN_SPREAD[((h >>> 1) + k) % SPAWN_SPREAD.length];
+    if (Math.abs(heightAt(c[0], c[1]) - base) <= 1) return { x: 0.5 + c[0], z: 0.5 + c[1] };
+  }
+  return { x: 0.5, z: 0.5 };
+}
+
+function defaultSpawnState(username = ""): { x: number; y: number; z: number; yaw: number; pitch: number } {
+  const at = spawnColumn(username);
+  return { x: at.x, y: heightAt(Math.floor(at.x), Math.floor(at.z)) + 1 + 1.7, z: at.z, yaw: 0, pitch: 0 };
 }
 
 async function handleRespawn(request: Request, env: Env, origin: string | null): Promise<Response> {
   const auth = await authenticate(request, env);
   if (!auth) return err("Log in first.", 401, origin);
+  const data = await body<{ server?: unknown }>(request);
+  const server = serverOf(request, data.server);
+  const denied = await gateServer(request, env, server, auth, origin);
+  if (denied) return denied;
   // Where a player wakes up is theirs to lose and to win back: `defaultSpawnState`
   // is the fallback, a script's `set_player_respawn_position` is the anchor.
-  const anchor = await env.DB.prepare("SELECT spawn_x,spawn_y,spawn_z FROM player_state WHERE user_id=?")
-    .bind(auth.user.id).first<{ spawn_x: number | null; spawn_y: number | null; spawn_z: number | null }>();
+  const anchor = await env.DB.prepare("SELECT spawn_x,spawn_y,spawn_z FROM player_state WHERE user_id=? AND server_id=?")
+    .bind(auth.user.id, server).first<{ spawn_x: number | null; spawn_y: number | null; spawn_z: number | null }>();
   // Number(null) is 0, which would wake every player who never set an anchor at
   // the bottom of the world: an anchor exists only when the column holds a
   // number.
@@ -1589,25 +1946,29 @@ async function handleRespawn(request: Request, env: Env, origin: string | null):
     .map(v => v === null || v === undefined ? null : Number(v));
   const state = at.every(v => v !== null && Number.isFinite(v))
     ? { x: at[0]!, y: at[1]!, z: at[2]!, yaw: 0, pitch: 0 }
-    : defaultSpawnState();
+    : defaultSpawnState(auth.user.username);
   await env.DB.prepare(
-    `INSERT INTO player_state(user_id,x,y,z,yaw,pitch,health) VALUES(?,?,?,?,?,?,?)
-     ON CONFLICT(user_id) DO UPDATE SET x=excluded.x, y=excluded.y, z=excluded.z,
+    `INSERT INTO player_state(user_id,server_id,x,y,z,yaw,pitch,health) VALUES(?,?,?,?,?,?,?,?)
+     ON CONFLICT(user_id, server_id) DO UPDATE SET x=excluded.x, y=excluded.y, z=excluded.z,
        yaw=excluded.yaw, pitch=excluded.pitch, health=excluded.health, updated_at=CURRENT_TIMESTAMP`
-  ).bind(auth.user.id, state.x, state.y, state.z, state.yaw, state.pitch, MAX_HEALTH).run();
+  ).bind(auth.user.id, server, state.x, state.y, state.z, state.yaw, state.pitch, MAX_HEALTH).run();
   // The live object clears the dead flag and pushes a respawn frame so the
   // player's sockets and the simulation agree immediately.
-  await notifyLive(env, "respawn", { name: auth.user.username, health: MAX_HEALTH, state });
+  await notifyLive(env, server, "respawn", { name: auth.user.username, health: MAX_HEALTH, state });
   // ...and its cached presence moves with them, or the body would keep standing
   // where they died for everyone else.
-  await notifyLive(env, "move", { name: auth.user.username, x: state.x, y: state.y, z: state.z });
+  await notifyLive(env, server, "move", { name: auth.user.username, x: state.x, y: state.y, z: state.z });
   return json({ ok: true, health: MAX_HEALTH, state }, 200, origin);
 }
 
 async function handleEat(request: Request, env: Env, origin: string | null): Promise<Response> {
   const auth = await authenticate(request, env);
   if (!auth) return err("Log in first.", 401, origin);
-  const data = await body<{ item_id: unknown }>(request);
+  // The client's eat call names no server (health is the only scoped field it
+  // touches here), so this keeps landing in `global` — the derivation is here
+  // for when it ever does.
+  const data = await body<{ item_id: unknown; server?: unknown }>(request);
+  const server = serverOf(request, data.server);
   const itemId = typeof data.item_id === "string" ? data.item_id.trim() : "";
   if (!validItemId(itemId)) return err("Invalid item ID.", 400, origin);
   const item = await env.DB.prepare("SELECT kind, heal FROM items WHERE id=?").bind(itemId).first<{ kind: string; heal: number }>();
@@ -1617,16 +1978,91 @@ async function handleEat(request: Request, env: Env, origin: string | null): Pro
   ).bind(auth.user.id, itemId).run();
   if (!debit.meta.changes) return err(`You have no ${itemId} to eat.`, 400, origin);
   await env.DB.prepare("DELETE FROM inventories WHERE user_id=? AND item_id=? AND quantity<=0").bind(auth.user.id, itemId).run();
-  const row = await env.DB.prepare("SELECT health FROM player_state WHERE user_id=?").bind(auth.user.id).first<{ health: number }>();
+  const row = await env.DB.prepare("SELECT health FROM player_state WHERE user_id=? AND server_id=?").bind(auth.user.id, server).first<{ health: number }>();
   const current = row ? Math.max(0, Math.min(MAX_HEALTH, Number(row.health) || 0)) : MAX_HEALTH;
   const health = Math.min(MAX_HEALTH, current + item.heal);
   await env.DB.prepare(
-    `INSERT INTO player_state(user_id,x,y,z,yaw,pitch,health)
-     SELECT id, ?, ?, ?, 0, 0, ? FROM users WHERE id = ?
-     ON CONFLICT(user_id) DO UPDATE SET health=excluded.health, updated_at=CURRENT_TIMESTAMP`
-  ).bind(0.5, heightAt(0, 0) + 2.7, 0.5, health, auth.user.id).run();
-  await notifyLive(env, "health", { name: auth.user.username, health });
+    `INSERT INTO player_state(user_id,server_id,x,y,z,yaw,pitch,health)
+     SELECT id, ?, ?, ?, ?, 0, 0, ? FROM users WHERE id = ?
+     ON CONFLICT(user_id, server_id) DO UPDATE SET health=excluded.health, updated_at=CURRENT_TIMESTAMP`
+  ).bind(server, 0.5, heightAt(0, 0) + 2.7, 0.5, health, auth.user.id).run();
+  await notifyLive(env, server, "health", { name: auth.user.username, health });
   return json({ ok: true, health }, 200, origin);
+}
+
+// ---- The world's clock ------------------------------------------------------
+// Anyone in the world may read it (a client needs the phase before it can draw
+// a sky); only the admin may dial it. `phase` is the fraction of the in-game day
+// (0 = midnight, 0.5 = noon) taken at `epoch_ms`; a client derives
+// `phase + (Date.now() - epoch_ms) / DAY_MS`, or just `phase` while `running` is
+// false. `phase: null` hands the clock back to the sun — every client then reads
+// the same phase off its own wall clock, which is how the cycle ran before
+// anybody owned it.
+async function readWorldClock(env: Env, server: string): Promise<{ phase: number | null; epoch: number; running: boolean }> {
+  const { results } = await env.DB
+    .prepare("SELECT phase, epoch_ms, running FROM world_clock WHERE id=1 AND server_id=?")
+    .bind(server)
+    .all<{ phase: number | null; epoch_ms: number; running: number }>();
+  const row = results[0];
+  return {
+    phase: row?.phase === null || row?.phase === undefined ? null : Number(row.phase),
+    epoch: Number(row?.epoch_ms) || 0,
+    running: (row?.running ?? 1) !== 0
+  };
+}
+
+async function handleGetTime(request: Request, env: Env, origin: string | null): Promise<Response> {
+  const server = serverOf(request);
+  // Reading a stranger's sky is exactly as gated as standing in their world;
+  // with no session the private rule still opens for the creating device.
+  const auth = server === GLOBAL_SERVER ? null : await authenticate(request, env);
+  const denied = await gateServer(request, env, server, auth, origin);
+  if (denied) return denied;
+  return json(await readWorldClock(env, server), 200, origin);
+}
+
+async function handleSetTime(request: Request, env: Env, origin: string | null): Promise<Response> {
+  const auth = await authenticate(request, env);
+  if (!auth) return err("Log in first.", 401, origin);
+  const data = await body<{ phase: unknown; running: unknown; reset: unknown; server?: unknown }>(request);
+  const server = serverOf(request, data.server);
+  const denied = await gateServer(request, env, server, auth, origin);
+  if (denied) return denied;
+  // Dial authority: the site admin for every world; for their own servers also
+  // the owner. `global` has no owner column to consult, so it stays admin-only.
+  if (!isAdminUser(auth.user.username)) {
+    if (server === GLOBAL_SERVER) return err("Only the admin account can set the time of day.", 403, origin);
+    const owned = await env.DB.prepare("SELECT owner FROM servers WHERE id=?").bind(server).first<{ owner: string }>();
+    if (!owned || owned.owner !== auth.user.username) return err("Only the admin account or the server's owner can set the time of day.", 403, origin);
+  }
+  const handBack = async (): Promise<Response> => {
+    await env.DB.prepare("DELETE FROM world_clock WHERE id=1 AND server_id=?").bind(server).run();
+    const clock = { phase: null, epoch: 0, running: true };
+    await notifyLive(env, server, "clock", clock);
+    return json({ ok: true, ...clock }, 200, origin);
+  };
+  if (data.reset === true) return handBack();
+
+  const current = await readWorldClock(env, server);
+  let phase = current.phase;
+  if (data.phase !== undefined && data.phase !== null) {
+    const p = Number(data.phase);
+    if (!Number.isFinite(p) || p < 0 || p >= 1) return err("phase must be a fraction of the day: 0 to 0.999.", 400, origin);
+    phase = p;
+  }
+  const running = data.running === undefined ? current.running : !!data.running;
+  // Stop is only worth storing next to a phase; dialling nothing and running is
+  // the same world as no row at all.
+  if (phase === null && running) return handBack();
+
+  const epoch = Date.now();
+  await env.DB.prepare(
+    `INSERT INTO world_clock (id,server_id,phase,epoch_ms,running,set_by,set_at) VALUES (1,?,?,?,?,?,CURRENT_TIMESTAMP)
+     ON CONFLICT(id, server_id) DO UPDATE SET phase=excluded.phase, epoch_ms=excluded.epoch_ms, running=excluded.running,
+       set_by=excluded.set_by, set_at=excluded.set_at`
+  ).bind(server, phase, epoch, running ? 1 : 0, auth.user.username).run();
+  await notifyLive(env, server, "clock", { phase, epoch, running });
+  return json({ ok: true, phase, epoch, running }, 200, origin);
 }
 
 export default {
@@ -1767,6 +2203,10 @@ export default {
         if (rulesError) return err(`Invalid placement rules: ${rulesError}`, 400, origin);
         const appearance = sanitizeImage(data.texture, 60_000, "Block texture");
         if (appearance.error) return err(appearance.error, 400, origin);
+        const topFace = sanitizeImage(data.texture_top, 60_000, "Top texture");
+        if (topFace.error) return err(topFace.error, 400, origin);
+        const bottomFace = sanitizeImage(data.texture_bottom, 60_000, "Bottom texture");
+        if (bottomFace.error) return err(bottomFace.error, 400, origin);
         const model = sanitizeModel(data.model);
         if (model.error) return err(model.error, 400, origin);
         const script = sanitizeScript(data.script);
@@ -1776,9 +2216,9 @@ export default {
         const fullId = `player:${auth.user.username.toLowerCase()}:${namespace.toLowerCase()}:${id.toLowerCase()}`;
         try {
           await env.DB.prepare(
-            "INSERT INTO blocks(id,name,creator_id,creator_name,hardness,light,colour,behaviour,rules_json,is_builtin,texture,model,script) VALUES(?,?,?,?,?,?,?,?,?,0,?,?,?)"
+            "INSERT INTO blocks(id,name,creator_id,creator_name,hardness,light,colour,behaviour,rules_json,is_builtin,texture,texture_top,texture_bottom,model,script) VALUES(?,?,?,?,?,?,?,?,?,0,?,?,?,?,?)"
           ).bind(fullId, name, auth.user.id, auth.user.username, hardness, light, colour, behaviour, JSON.stringify(rules),
-            appearance.value, model.value, script.value).run();
+            appearance.value, topFace.value, bottomFace.value, model.value, script.value).run();
         } catch {
           return err("That block ID already exists.", 409, origin);
         }
@@ -1810,14 +2250,18 @@ export default {
         if (rulesError) return err(`Invalid placement rules: ${rulesError}`, 400, origin);
         const appearance = sanitizeImage(data.texture, 60_000, "Block texture");
         if (appearance.error) return err(appearance.error, 400, origin);
+        const topFace = sanitizeImage(data.texture_top, 60_000, "Top texture");
+        if (topFace.error) return err(topFace.error, 400, origin);
+        const bottomFace = sanitizeImage(data.texture_bottom, 60_000, "Bottom texture");
+        if (bottomFace.error) return err(bottomFace.error, 400, origin);
         const model = sanitizeModel(data.model);
         if (model.error) return err(model.error, 400, origin);
         const script = sanitizeScript(data.script);
         if (script.error) return err(script.error, 400, origin);
         await env.DB.prepare(
-          "UPDATE blocks SET name=?,hardness=?,light=?,colour=?,behaviour=?,rules_json=?,texture=?,model=?,script=?,updated_at=CURRENT_TIMESTAMP WHERE id=?"
+          "UPDATE blocks SET name=?,hardness=?,light=?,colour=?,behaviour=?,rules_json=?,texture=?,texture_top=?,texture_bottom=?,model=?,script=?,updated_at=CURRENT_TIMESTAMP WHERE id=?"
         ).bind(name, hardness, light, colour, behaviour, JSON.stringify(rules),
-          appearance.value, model.value, script.value, id).run();
+          appearance.value, topFace.value, bottomFace.value, model.value, script.value, id).run();
         return json({ ok: true }, 200, origin);
       }
 
@@ -1835,8 +2279,8 @@ export default {
         // and referencing recipes are dropped, so "delete my test block" always
         // works without manual world cleanup first.
         const placed = await env.DB.prepare(
-          "SELECT x,y,z FROM world_edits WHERE block_id=?"
-        ).bind(id).all<{ x: number; y: number; z: number }>();
+          "SELECT x,y,z,server_id FROM world_edits WHERE block_id=?"
+        ).bind(id).all<{ x: number; y: number; z: number; server_id: string }>();
         const recipes = await env.DB.prepare(
           "SELECT ingredients_json FROM recipes WHERE result_id=? OR ingredients_json LIKE ?"
         ).bind(id, `%"${id}"%`).all<{ ingredients_json: string }>();
@@ -1844,10 +2288,16 @@ export default {
         await env.DB.prepare("DELETE FROM recipes WHERE result_id=? OR ingredients_json LIKE ?")
           .bind(id, `%"${id}"%`).run();
         // The edits are gone, so the log rows, script memory and light columns
-        // that pointed at them are stale the same instant.
-        const stale = await pruneOrphanWorldRows(env);
+        // that pointed at them are stale the same instant — in EVERY world the
+        // block was standing in, so pruning and publishing are per server.
+        const servers = [...new Set(placed.results.map(row => row.server_id))];
+        let stale = { log: 0, state: 0, beams: 0, inv: 0 };
+        for (const server of servers) {
+          const counts = await pruneOrphanWorldRows(env, server);
+          stale = { log: stale.log + counts.log, state: stale.state + counts.state, beams: stale.beams + counts.beams, inv: stale.inv + counts.inv };
+        }
         for (const cell of placed.results) {
-          await publishEdit(env, cell.x, cell.y, cell.z, "air");
+          await publishEdit(env, cell.server_id, cell.x, cell.y, cell.z, "air");
         }
         await env.DB.prepare("DELETE FROM blocks WHERE id=?").bind(id).run();
         // Stale inventory stacks for a block that no longer exists are dead weight.
@@ -2006,13 +2456,114 @@ export default {
         return json({ ok: true }, 200, origin);
       }
 
+      // ---- Own servers ------------------------------------------------------------
+      // A server is a scoped world owned by one account. `global` is never a
+      // row here: the list prepends it synthetically so the client sees the
+      // shared world without the database ever needing a placeholder for it.
+      if (path === "/api/servers" && request.method === "GET") {
+        const auth = await authenticate(request, env);
+        const { results } = await env.DB
+          .prepare("SELECT id,name,owner,visibility,device_hash,host_ip FROM servers ORDER BY created_at, id")
+          .all<ServerRow>();
+        // Listing follows the join rules: everything public is listed, and a
+        // closed world appears only for the people who could enter it.
+        const device = request.headers.get("X-AC-Device") || "";
+        const deviceHash = /^[0-9a-f]{32,}$/i.test(device) ? await sha256Hex(device) : "";
+        const ip = clientIpOf(request);
+        const servers: unknown[] = [{
+          id: GLOBAL_SERVER, name: "Global", owner: "", visibility: "public",
+          players: await livePlayers(env, GLOBAL_SERVER), mine: false
+        }];
+        for (const row of results) {
+          const mine = !!auth && auth.user.username === row.owner;
+          const admin = !!auth && isAdminUser(auth.user.username);
+          const own = mine || admin || (!!row.device_hash && row.device_hash === deviceHash);
+          const lanOpen = row.visibility === "lan" && sameLan24(ip, row.host_ip);
+          if (row.visibility !== "public" && !lanOpen && !own) continue;
+          servers.push({
+            id: row.id, name: row.name, owner: row.owner, visibility: row.visibility,
+            players: await livePlayers(env, row.id), mine
+          });
+        }
+        return json({ servers }, 200, origin);
+      }
+
+      if (path === "/api/servers" && request.method === "POST") {
+        const auth = await authenticate(request, env);
+        if (!auth) return err("Log in first.", 401, origin);
+        const data = await body<{ name?: unknown; visibility?: unknown }>(request);
+        // Error bodies here are terse tokens by contract — the client renders
+        // the message, the API only names the failed rule.
+        const name = String(data.name ?? "").trim();
+        if (!name || name.length > 32) return err("name", 400, origin);
+        const visibility = String(data.visibility ?? "");
+        if (visibility !== "private" && visibility !== "lan" && visibility !== "public")
+          return err("visibility", 400, origin);
+        const owned = await env.DB.prepare("SELECT COUNT(*) AS n FROM servers WHERE owner=?")
+          .bind(auth.user.username).first<{ n: number }>();
+        if ((owned?.n ?? 0) >= MAX_SERVERS_PER_ACCOUNT) return err("limit", 409, origin);
+        // What creating opens up to: the creating device's secret goes in only
+        // as a hash, and the creator's IP is what the lan rule later matches.
+        const device = request.headers.get("X-AC-Device") || "";
+        const deviceHash = /^[0-9a-f]{32,}$/i.test(device) ? await sha256Hex(device) : null;
+        const id = crypto.randomUUID();
+        await env.DB.prepare("INSERT INTO servers(id,name,owner,visibility,device_hash,host_ip) VALUES(?,?,?,?,?,?)")
+          .bind(id, name, auth.user.username, visibility, deviceHash, clientIpOf(request) || null).run();
+        return json({ server: { id, name, owner: auth.user.username, visibility, players: 0, mine: true } }, 201, origin);
+      }
+
+      // `global` can never be deleted — not even by the site admin: it is the
+      // implicit default of every scoped table, not a row anywhere.
+      if (path === "/api/servers/global" && request.method === "DELETE") return err("global", 400, origin);
+      const serverMatch = path.match(/^\/api\/servers\/([0-9a-f-]{36})$/);
+      if (serverMatch && request.method === "DELETE") {
+        const auth = await authenticate(request, env);
+        if (!auth) return err("Log in first.", 401, origin);
+        const id = serverMatch[1];
+        const row = await env.DB.prepare("SELECT id,owner FROM servers WHERE id=?").bind(id).first<{ id: string; owner: string }>();
+        if (!row) return err("server", 404, origin);
+        if (row.owner !== auth.user.username && !isAdminUser(auth.user.username)) return err("owner", 403, origin);
+        // Deleting a server drops its whole world: blocks, log, clock, player
+        // positions, scripted memory, light columns, cell stores.
+        await env.DB.batch([
+          env.DB.prepare("DELETE FROM world_edits WHERE server_id=?").bind(id),
+          env.DB.prepare("DELETE FROM world_log WHERE server_id=?").bind(id),
+          env.DB.prepare("DELETE FROM player_state WHERE server_id=?").bind(id),
+          env.DB.prepare("DELETE FROM block_beams WHERE server_id=?").bind(id),
+          env.DB.prepare("DELETE FROM block_state WHERE server_id=?").bind(id),
+          env.DB.prepare("DELETE FROM block_inventory WHERE server_id=?").bind(id),
+          env.DB.prepare("DELETE FROM world_clock WHERE server_id=?").bind(id),
+          env.DB.prepare("DELETE FROM servers WHERE id=?").bind(id)
+        ]);
+        return json({ ok: true }, 200, origin);
+      }
+
       // ---- Shared world --------------------------------------------------------
       if (path === "/api/world/live" && request.headers.get("Upgrade") === "websocket") {
-        const stub = env.WORLD_LIVE.get(env.WORLD_LIVE.idFromName("world"));
-        return stub.fetch(request);
+        const server = serverOf(request);
+        const auth = await authenticate(request, env);
+        // Same join gate as the REST world endpoints: a closed world gets the
+        // same 403 JSON here, which the browser reports as a failed handshake.
+        const denied = await gateServer(request, env, server, auth, origin);
+        if (denied) return denied;
+        // The forwarded URL still carries `?server=`, which is how the object
+        // binds its identity — the upgrade request has no body.
+        const stub = env.WORLD_LIVE.get(env.WORLD_LIVE.idFromName(server));
+        // Hand the object the account the session cookie belongs to, so
+        // presence identity is the login and not a client frame. Any value the
+        // browser sent is dropped first - only this Worker stamps it.
+        const headers = new Headers(request.headers);
+        headers.delete(WS_IDENTITY);
+        if (auth) headers.set(WS_IDENTITY, auth.user.username);
+        return stub.fetch(new Request(request, { headers }));
       }
 
       if (path === "/api/world" && request.method === "GET") {
+        const server = serverOf(request);
+        // A stranger must not even read the shape of someone's world.
+        const auth = server === GLOBAL_SERVER ? null : await authenticate(request, env);
+        const denied = await gateServer(request, env, server, auth, origin);
+        if (denied) return denied;
         const coord = (name: string): number => {
           const value = Number(url.searchParams.get(name));
           return Number.isInteger(value) && value >= -WORLD_COORD_LIMIT && value <= WORLD_COORD_LIMIT ? value : 0;
@@ -2023,23 +2574,25 @@ export default {
         const since = Number(url.searchParams.get("since")) || 0;
         // Player edits are sparse overlays of the procedural base — a volume
         // query returns only the changed cells, capped well above any sane
-        // active-world edit count.
+        // active-world edit count. Every row is scoped: `global` is the whole
+        // legacy world, a server only ever sees its own.
         const [edits, log, head, beams] = await Promise.all([
-          env.DB.prepare("SELECT x,y,z,block_id FROM world_edits WHERE x BETWEEN ? AND ? AND y BETWEEN ? AND ? AND z BETWEEN ? AND ? LIMIT 20000")
-            .bind(x0, x1, y0, y1, z0, z1).all<EditRow>(),
+          env.DB.prepare("SELECT x,y,z,block_id FROM world_edits WHERE server_id=? AND x BETWEEN ? AND ? AND y BETWEEN ? AND ? AND z BETWEEN ? AND ? LIMIT 20000")
+            .bind(server, x0, x1, y0, y1, z0, z1).all<EditRow>(),
           // Newest first, then back in order: a client whose cursor fell behind
           // the retained window is corrected by the `edits` snapshot anyway.
-          // A log row only means anything while its cell still reads that same
-          // block in `world_edits`; anything else is a leftover from a deleted
-          // block and would repaint a cell the database says is empty.
+          // A log row only means anything while its cell — in the SAME world —
+          // still reads that same block in `world_edits`; anything else is a
+          // leftover from a deleted block and would repaint a cell the
+          // database says is empty.
           env.DB.prepare(`SELECT seq,x,y,z,block_id FROM (
-              SELECT seq,x,y,z,block_id FROM world_log l WHERE seq > ? AND EXISTS (
-                SELECT 1 FROM world_edits e WHERE e.x=l.x AND e.y=l.y AND e.z=l.z AND e.block_id=l.block_id
+              SELECT seq,x,y,z,block_id FROM world_log l WHERE l.server_id=? AND seq > ? AND EXISTS (
+                SELECT 1 FROM world_edits e WHERE e.server_id=l.server_id AND e.x=l.x AND e.y=l.y AND e.z=l.z AND e.block_id=l.block_id
               ) ORDER BY seq DESC LIMIT ${WORLD_LOG_KEEP}
             ) ORDER BY seq ASC`)
-            .bind(since).all<LogRow>(),
-          env.DB.prepare("SELECT COALESCE(MAX(seq), 0) AS head FROM world_log").first<{ head: number }>(),
-          listBeams(env)
+            .bind(server, since).all<LogRow>(),
+          env.DB.prepare("SELECT COALESCE(MAX(seq), 0) AS head FROM world_log WHERE server_id=?").bind(server).first<{ head: number }>(),
+          listBeams(env, server)
         ]);
         return json({ edits: edits.results, log: log.results, head: head?.head ?? 0, beams }, 200, origin);
       }
@@ -2053,6 +2606,10 @@ export default {
       if (path === "/api/player/respawn" && request.method === "POST") return handleRespawn(request, env, origin);
       if (path === "/api/player/eat" && request.method === "POST") return handleEat(request, env, origin);
       if (path === "/api/player/appearance" && request.method === "POST") return handlePostPlayerAppearance(request, env, origin);
+
+      // The world's clock: readable by anyone in the world, dialled by the admin.
+      if (path === "/api/time" && request.method === "GET") return handleGetTime(request, env, origin);
+      if (path === "/api/time" && request.method === "POST") return handleSetTime(request, env, origin);
 
       // ---- Inventory ------------------------------------------------------------
       if (path === "/api/inventory" && request.method === "GET") {
