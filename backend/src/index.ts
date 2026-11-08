@@ -61,6 +61,11 @@ const HEALTH_RECHECK_MS = 2000;
 
 const MAX_MOBS = 12;
 const MOB_TICK_MS = 250;
+// Pose frames arrive four times a second; an entry that has gone quiet for
+// this long has a dead socket behind it (no close event came), so the sweep
+// in sweepStale removes it. 15 s is ~60 missed heartbeats: a backgrounded
+// tab (throttled to ~1 Hz) is never at risk.
+const PRESENCE_STALE_MS = 15_000;
 // Mobs appear in a ring around the players, not on top of them: far enough to
 // hear and see coming, close enough to be worth meeting. A hostile born at the
 // far side of that ring still notices the player it was spawned for — the chase
@@ -112,6 +117,11 @@ type Presence = {
   heldItem?: string;
   appearance?: Appearance;
   health: number; dead: boolean; healthLoaded: boolean;
+  // Wall-clock of the last pose frame. A socket whose frames stop (dead TCP
+  // the runtime never reported closed, a wedged proxy) must not stand in
+  // everyone's world forever: the object's tick sweeps entries older than
+  // PRESENCE_STALE_MS, which is many times the 4 Hz pose rate.
+  seen: number;
 };
 
 // Wire shape for roster/pose frames: pose + velocity (receivers dead-reckon
@@ -362,6 +372,7 @@ export class WorldLive extends DurableObject<Env> {
     await this.bindServer(null);
     const now = Date.now();
     await this.ensureHealth();
+    this.sweepStale(now);
     await this.stepMobs(now);
     this.broadcast({
       type: "mobs",
@@ -377,6 +388,24 @@ export class WorldLive extends DurableObject<Env> {
   }
 
   // ---- simulation ----------------------------------------------------------
+
+  // Sweep ghosts: a TCP that died without the runtime ever reporting close
+  // (killed browser, wedged proxy, dev runtimes that never close sockets)
+  // would otherwise stand in everyone's world forever — pose frames are the
+  // heartbeat, and a live player sends one four times a second, so an entry
+  // with no frames for PRESENCE_STALE_MS is dead. The entry vanishes from
+  // rosters immediately; closing the object side lets the usual close handler
+  // tidy anything the runtime still sees.
+  private sweepStale(now: number): void {
+    for (const [socket, entry] of [...this.presence]) {
+      if (now - entry.seen < PRESENCE_STALE_MS) continue;
+      this.presence.delete(socket);
+      const name = entry.name;
+      this.sendOthers(socket, { type: "leave", name });
+      void this.flushHealth(now, name);
+      try { socket.close(1000, "stale"); } catch { /* the socket is already gone */ }
+    }
+  }
 
   private async stepMobs(now: number): Promise<void> {
     const players = [...this.presence.values()].filter(entry => !entry.dead);
@@ -675,7 +704,8 @@ export class WorldLive extends DurableObject<Env> {
         ...(appearance ? { appearance } : {}),
         health: entry?.health ?? MAX_HEALTH,
         dead: entry?.dead ?? false,
-        healthLoaded: entry?.healthLoaded ?? false
+        healthLoaded: entry?.healthLoaded ?? false,
+        seen: Date.now()
       };
       this.presence.set(socket, pose);
       this.sendOthers(socket, { type: "pose", ...wirePose(pose) });
