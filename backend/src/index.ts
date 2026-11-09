@@ -1261,6 +1261,27 @@ async function pruneOrphanWorldRows(env: Env, server: string): Promise<{ log: nu
   return { log: log?.n ?? 0, state: state?.n ?? 0, beams: beams?.n ?? 0, inv: inv?.n ?? 0 };
 }
 
+// The light columns a prune is about to delete, captured BEFORE it runs. The
+// prune removes rows no frame announced, so every open socket keeps drawing a
+// ghost beam; whoever captures these publishes a `colour: null` beam frame for
+// each cell, right after the air edit of the cell underneath.
+async function orphanBeamCells(env: Env, server: string): Promise<Array<{ x: number; y: number; z: number }>> {
+  const rows = await env.DB.prepare(
+    `SELECT x,y,z FROM block_beams b WHERE b.server_id=? AND NOT EXISTS (
+      SELECT 1 FROM world_edits e WHERE e.server_id=b.server_id AND e.x=b.x AND e.y=b.y AND e.z=b.z)`
+  ).bind(server).all<{ x: number; y: number; z: number }>();
+  return rows.results;
+}
+
+// Cheap change-detector for the beam table: the pair moves whenever a row is
+// inserted, replaced or deleted — MAX(rowid) survives a same-second delete and
+// re-insert, which MAX(updated_at) would miss.
+async function beamStamp(env: Env, server: string): Promise<string> {
+  const row = await env.DB.prepare("SELECT COUNT(*) AS n, COALESCE(MAX(rowid), 0) AS r FROM block_beams WHERE server_id=?")
+    .bind(server).first<{ n: number; r: number }>();
+  return `${row?.n ?? 0}/${row?.r ?? 0}`;
+}
+
 // Tell the live object about a health change made over REST (respawn, eat) so
 // its in-memory presence agrees and live sockets update. If the object is not
 // running this is a harmless no-op. The payload carries the server id both to
@@ -1482,16 +1503,24 @@ async function handlePlace(request: Request, env: Env, origin: string | null): P
   if (!debit.meta.changes)
     return json({ error: `You have no ${itemId} in your inventory.`, code: "no_item" }, 400, origin);
 
+  // A stale light column under this cell (a beam row that survived an earlier
+  // rewrite) must die with the rewrite, or the orphan prune can never reach it
+  // and the ghost beam re-paints on every join. Pre-read like handleBreak's.
+  const staleBeam = await env.DB.prepare("SELECT colour FROM block_beams WHERE server_id=? AND x=? AND y=? AND z=?")
+    .bind(server, x, y, z).first<{ colour: string }>();
+
   await env.DB.batch([
     env.DB.prepare(
       "INSERT INTO world_edits(server_id,x,y,z,block_id,placed_by) VALUES(?,?,?,?,?,?) ON CONFLICT(server_id,x,y,z) DO UPDATE SET block_id=excluded.block_id, placed_by=excluded.placed_by, created_at=CURRENT_TIMESTAMP"
     ).bind(server, x, y, z, blockId, auth.user.id),
     env.DB.prepare("INSERT INTO world_log(server_id,x,y,z,block_id) VALUES(?,?,?,?,?)").bind(server, x, y, z, blockId),
     // The log is a catch-up queue, not an archive: keep only the newest edits
-    // of THIS world — another server's busy log must not evict this one's.
-    env.DB.prepare("DELETE FROM world_log WHERE server_id=? AND seq <= (SELECT MAX(seq) - ? FROM world_log WHERE server_id=?)").bind(server, WORLD_LOG_KEEP, server)
+    // of THIS world — another world's busy log must not evict this one's.
+    env.DB.prepare("DELETE FROM world_log WHERE server_id=? AND seq <= (SELECT MAX(seq) - ? FROM world_log WHERE server_id=?)").bind(server, WORLD_LOG_KEEP, server),
+    ...(staleBeam ? [env.DB.prepare("DELETE FROM block_beams WHERE server_id=? AND x=? AND y=? AND z=?").bind(server, x, y, z)] : [])
   ]);
   await publishEdit(env, server, x, y, z, blockId);
+  if (staleBeam) await publishFrame(env, server, { type: "beam", x, y, z, colour: null });
   return json({ ok: true, x, y, z, id: blockId }, 201, origin);
 }
 
@@ -2447,12 +2476,22 @@ export default {
         // block was standing in, so pruning and publishing are per server.
         const servers = [...new Set(placed.results.map(row => row.server_id))];
         let stale = { log: 0, state: 0, beams: 0, inv: 0 };
+        const ghostBeams = new Map<string, Array<{ x: number; y: number; z: number }>>();
         for (const server of servers) {
+          // Capture the light columns this prune is about to delete before it
+          // runs: without a frame, every open socket keeps drawing the beam of
+          // a block that no longer exists until the page reloads.
+          ghostBeams.set(server, await orphanBeamCells(env, server));
           const counts = await pruneOrphanWorldRows(env, server);
           stale = { log: stale.log + counts.log, state: stale.state + counts.state, beams: stale.beams + counts.beams, inv: stale.inv + counts.inv };
         }
         for (const cell of placed.results) {
           await publishEdit(env, cell.server_id, cell.x, cell.y, cell.z, "air");
+        }
+        for (const [server, cells] of ghostBeams) {
+          for (const cell of cells) {
+            await publishFrame(env, server, { type: "beam", x: cell.x, y: cell.y, z: cell.z, colour: null });
+          }
         }
         await env.DB.prepare("DELETE FROM blocks WHERE id=?").bind(id).run();
         // Stale inventory stacks for a block that no longer exists are dead weight.
@@ -2735,7 +2774,7 @@ export default {
         // query returns only the changed cells, capped well above any sane
         // active-world edit count. Every row is scoped: `global` is the whole
         // legacy world, a server only ever sees its own.
-        const [edits, log, head, beams] = await Promise.all([
+        const [edits, log, head, beams, stamp] = await Promise.all([
           env.DB.prepare("SELECT x,y,z,block_id FROM world_edits WHERE server_id=? AND x BETWEEN ? AND ? AND y BETWEEN ? AND ? AND z BETWEEN ? AND ? LIMIT 20000")
             .bind(server, x0, x1, y0, y1, z0, z1).all<EditRow>(),
           // Newest first, then back in order: a client whose cursor fell behind
@@ -2751,9 +2790,23 @@ export default {
             ) ORDER BY seq ASC`)
             .bind(server, since).all<LogRow>(),
           env.DB.prepare("SELECT COALESCE(MAX(seq), 0) AS head FROM world_log WHERE server_id=?").bind(server).first<{ head: number }>(),
-          listBeams(env, server)
+          listBeams(env, server),
+          beamStamp(env, server)
         ]);
-        return json({ edits: edits.results, log: log.results, head: head?.head ?? 0, beams }, 200, origin);
+        return json({ edits: edits.results, log: log.results, head: head?.head ?? 0, beams, beamStamp: stamp }, 200, origin);
+      }
+
+      // The 4 s catch-up while the socket is OPEN: the full world query is for
+      // rebuilding a page, this is the cheap delta poll. Light columns are the
+      // one thing broadcast frames can lose without the log replaying them —
+      // when the stamp moved, the client re-diffs against what it is drawing.
+      if (path === "/api/world/beams" && request.method === "GET") {
+        const server = serverOf(request);
+        const auth = server === GLOBAL_SERVER ? null : await authenticate(request, env);
+        const denied = await gateServer(request, env, server, auth, origin);
+        if (denied) return denied;
+        const [beams, stamp] = await Promise.all([listBeams(env, server), beamStamp(env, server)]);
+        return json({ beams, beamStamp: stamp }, 200, origin);
       }
 
       if (path === "/api/world/place" && request.method === "POST") return handlePlace(request, env, origin);
