@@ -8,6 +8,7 @@
 // deterministic trees and caves — identical in the Worker and the browser.
 
 export const WORLD_Y = 32; // legal solid band is y ∈ [0, 31]
+export const SEA_LEVEL = 10; // columns with heightAt < this flood up to y=SEA_LEVEL
 
 function hashU32(n: number): number {
   n = (n | 0) ^ 0x9e3779b9;
@@ -80,24 +81,29 @@ export function baseBlock(x: number, y: number, z: number): string {
   if (y === 0) return "builtin:bedrock";
   const h = heightAt(x, z);
   if (y > h) {
-    if (hasTree(x, z) && y <= h + 5) return "builtin:wood"; // trunk
+    // Sea: flooded columns fill with still water up to SEA_LEVEL. The sea is
+    // static — no flow simulation. Trees never sit in the sea (gated below),
+    // so a flooded column is pure water over its floor.
+    if (h < SEA_LEVEL && y <= SEA_LEVEL) return "builtin:water";
+    if (h >= SEA_LEVEL && hasTree(x, z) && y <= h + 5) return "builtin:wood"; // trunk
     // The crown sits on top of the trunk: the point that used to be empty
     // directly above the trunk is now two leaves of crown, one level higher
     // than the old canopy top.
-    if (hasTree(x, z) && (y === h + 6 || y === h + 7)) return "builtin:leaves";
+    if (h >= SEA_LEVEL && hasTree(x, z) && (y === h + 6 || y === h + 7)) return "builtin:leaves";
     for (let dx = -2; dx <= 2; dx++) {
       for (let dz = -2; dz <= 2; dz++) {
         if (dx === 0 && dz === 0) continue;
         if (Math.abs(dx) + Math.abs(dz) > 2) continue;
         if (!hasTree(x + dx, z + dz)) continue;
         const h2 = heightAt(x + dx, z + dz);
+        if (h2 < SEA_LEVEL) continue; // no canopy over the sea
         if (y >= h2 + 4 && y <= h2 + 6) return "builtin:leaves";
       }
     }
     return "air";
   }
   if (y < h && caveAt(x, y, z) && y > 1) return "air";
-  if (y === h) return "builtin:grass";
+  if (y === h) return h < SEA_LEVEL ? "builtin:sand" : "builtin:grass"; // beaches
   if (y >= h - 3) return "builtin:dirt";
   return "builtin:stone";
 }

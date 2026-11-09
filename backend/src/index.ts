@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { baseBlock, heightAt, WORLD_Y } from "./terrain";
+import { baseBlock, heightAt, SEA_LEVEL, WORLD_Y } from "./terrain";
 import { runBlockScript, type ScriptOutcome, type ScriptState } from "./lua";
 
 export interface Env {
@@ -388,6 +388,7 @@ export class WorldLive extends DurableObject<Env> {
     });
     await this.flushHealth(now);
     await this.spawnOne(now);
+    await this.stepCrops(now);
     if (this.sockets.length) await this.ctx.storage.setAlarm(Date.now() + MOB_TICK_MS);
   }
 
@@ -522,13 +523,44 @@ export class WorldLive extends DurableObject<Env> {
     });
   }
 
+  // Crops: every ~20 s, advance at most 32 wheat cells one stage. A cell's
+  // created_at is the clock (every edit stamps it), so "20 s since it became
+  // this stage" needs no extra column. placed_by rides along from the row —
+  // growth is not a user edit (TEXT FK to users).
+  private async stepCrops(now: number): Promise<void> {
+    if (!now || now % 20000 >= MOB_TICK_MS) return; // DO memory clock; hibernation-safe enough
+    const { results } = await this.env.DB.prepare(
+      "SELECT x,y,z,block_id,placed_by FROM world_edits WHERE server_id=? AND block_id IN ('builtin:wheat_1','builtin:wheat_2','builtin:wheat_3') LIMIT 32"
+    ).bind(this.scope()).all<{ x: number; y: number; z: number; block_id: string; placed_by: string | null }>();
+    for (const r of results) {
+      const aged = await this.env.DB.prepare(
+        "SELECT 1 AS stale FROM world_edits WHERE server_id=? AND x=? AND y=? AND z=? AND created_at > datetime('now','-20 seconds')"
+      ).bind(this.scope(), r.x, r.y, r.z).first();
+      if (aged) continue;
+      const next = "builtin:wheat_" + (Number(r.block_id.slice(-1)) + 1);
+      // Mirror the place-write shape (upsert + log + prune + publishEdit).
+      await this.env.DB.batch([
+        this.env.DB.prepare(
+          "INSERT INTO world_edits(server_id,x,y,z,block_id,placed_by) VALUES(?,?,?,?,?,?) ON CONFLICT(server_id,x,y,z) DO UPDATE SET block_id=excluded.block_id, created_at=CURRENT_TIMESTAMP"
+        ).bind(this.scope(), r.x, r.y, r.z, next, r.placed_by),
+        this.env.DB.prepare("INSERT INTO world_log(server_id,x,y,z,block_id) VALUES(?,?,?,?,?)")
+          .bind(this.scope(), r.x, r.y, r.z, next),
+        this.env.DB.prepare("DELETE FROM world_log WHERE server_id=? AND seq <= (SELECT MAX(seq) - ? FROM world_log WHERE server_id=?)")
+          .bind(this.scope(), WORLD_LOG_KEEP, this.scope()),
+      ]);
+      await publishEdit(this.env, this.scope(), r.x, r.y, r.z, next);
+    }
+  }
+
   // Top solid y of a column: terrain height, raised above any player-placed
   // block. Cached with a short TTL so the tick never floods D1.
   private async columnTop(x: number, z: number): Promise<number> {
     const key = `${x},${z}`;
     const cached = this.columns.get(key);
     if (cached && Date.now() - cached.at < COLUMN_TTL_MS) return cached.top;
-    let top = heightAt(x, z);
+    // Sea surface counts as walkable ground: mobs over a flooded column stand
+    // at the waterline (wading), never mid-water.
+    let top = Math.max(heightAt(x, z), SEA_LEVEL);
     try {
       const { results } = await this.env.DB
         .prepare("SELECT y, block_id FROM world_edits WHERE server_id=? AND x=? AND z=?")
@@ -2061,6 +2093,31 @@ async function handleEat(request: Request, env: Env, origin: string | null): Pro
   return json({ ok: true, health }, 200, origin);
 }
 
+// Workshop syntax gate: run the draft through the REAL sandbox without
+// letting it touch anything. The entry named here almost never exists in a
+// draft that is merely being parsed, so `missingEntryIsNoop` turns the run
+// into a pure syntax check; the caps bound the rare draft that does define
+// it. A parse error comes back with the 1-based line the editor marks.
+async function handleScriptCheck(request: Request, env: Env, origin: string | null): Promise<Response> {
+  const auth = await authenticate(request, env);
+  if (!auth) return err("Log in first.", 401, origin);
+  const data = await body<{ script?: unknown }>(request);
+  const script = sanitizeScript(data.script === undefined || data.script === null ? "" : data.script);
+  if (script.error) return err(script.error, 400, origin);
+  if (!script.value) return json({ ok: true }, 200, origin); // an empty script is a clean parse
+  const quiet: ScriptState = { get: () => null, set: () => {} };
+  const outcome = runBlockScript(
+    script.value, "on_interact",
+    { player: "tester", x: 0, y: 0, z: 0 },
+    quiet,
+    { maxInstructions: 200, wallMs: 250, missingEntryIsNoop: true },
+  );
+  if (outcome.ok) return json({ ok: true }, 200, origin);
+  const byte = /near byte (\d+)/.exec(outcome.error || "");
+  const line = byte ? script.value.slice(0, Number(byte[1])).split("\n").length : null;
+  return json({ ok: false, error: outcome.error, line }, 200, origin);
+}
+
 // ---- The world's clock ------------------------------------------------------
 // Anyone in the world may read it (a client needs the phase before it can draw
 // a sky); only the admin may dial it. `phase` is the fraction of the in-game day
@@ -2703,6 +2760,7 @@ export default {
       if (path === "/api/world/break" && request.method === "POST") return handleBreak(request, env, origin);
       if (path === "/api/world/resync" && request.method === "POST") return handleWorldResync(request, env, origin);
       if (path === "/api/block/interact" && request.method === "POST") return handleBlockInteract(request, env, origin);
+      if (path === "/api/block/script-check" && request.method === "POST") return handleScriptCheck(request, env, origin);
       if (path === "/api/player/state" && request.method === "GET") return handleGetPlayerState(request, env, origin);
       if (path === "/api/player/state" && request.method === "POST") return handlePutPlayerState(request, env, origin);
       if (path === "/api/player/respawn" && request.method === "POST") return handleRespawn(request, env, origin);
