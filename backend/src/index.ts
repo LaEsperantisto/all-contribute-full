@@ -1269,6 +1269,7 @@ type BlockRow = {
   colour: string; behaviour: string; rules_json: string; is_builtin: number;
   texture: string | null; texture_top: string | null; texture_bottom: string | null;
   model: string | null; script: string | null;
+  drop_item_id: string | null; drop_qty: number;
 };
 
 // The voxel models the renderer actually ships (vlox hardcodes the list; an
@@ -1308,13 +1309,14 @@ function sanitizeScript(raw: unknown): { value: string | null; error: string | n
 
 async function listBlocks(env: Env): Promise<unknown[]> {
   const { results } = await env.DB.prepare(
-    "SELECT id,name,creator_name AS creator,hardness,light,colour,behaviour,rules_json,is_builtin,texture,texture_top,texture_bottom,model,script FROM blocks ORDER BY is_builtin DESC,name LIMIT 500"
+    "SELECT id,name,creator_name AS creator,hardness,light,colour,behaviour,rules_json,is_builtin,texture,texture_top,texture_bottom,model,script,drop_item_id,drop_qty FROM blocks ORDER BY is_builtin DESC,name LIMIT 500"
   ).all<BlockRow>();
   return results.map(row => ({
     id: row.id, name: row.name, creator: row.creator, hardness: row.hardness, light: row.light,
     colour: row.colour, behaviour: row.behaviour, is_builtin: row.is_builtin, rules: parseRules(row.rules_json),
     texture: row.texture ?? null, texture_top: row.texture_top ?? null, texture_bottom: row.texture_bottom ?? null,
-    model: row.model ?? null, script: row.script ?? null
+    model: row.model ?? null, script: row.script ?? null,
+    drop_item_id: row.drop_item_id ?? null, drop_qty: row.drop_qty ?? 1
   }));
 }
 
@@ -1478,15 +1480,34 @@ async function handleBreak(request: Request, env: Env, origin: string | null): P
   if (current === "builtin:bedrock")
     return json({ error: "Bedrock is unbreakable.", code: "unbreakable" }, 400, origin);
 
-  // The credited drop is the item that programmes this block (builtin first);
-  // blocks with no programming item fall back to their own id, preserving the
-  // old behaviour for any leftover stacks.
-  const dropper = await env.DB.prepare(
-    "SELECT id FROM items WHERE place_block_id=? ORDER BY is_builtin DESC, id ASC LIMIT 1"
-  ).bind(current).first<{ id: string }>();
-  const dropId = dropper?.id ?? current;
+  // The credited drop is declared per block: an explicit drop_item_id (with
+  // drop_qty, clamped 1..99) if set, otherwise the item that programmes this
+  // block (builtin first), falling back to the block's own id — the old
+  // behaviour. A declared item may have been deleted since; that falls back
+  // too. If the fallback id has no item row at all (base-terrain-only blocks
+  // like water), credit NOTHING rather than leak a phantom stack.
+  const blockRow = await env.DB.prepare(
+    "SELECT drop_item_id, drop_qty FROM blocks WHERE id=?"
+  ).bind(current).first<{ drop_item_id: string | null; drop_qty: number }>();
+  let dropId: string | null;
+  let dropQty: number;
+  if (blockRow?.drop_item_id) {
+    const known = await env.DB.prepare("SELECT id FROM items WHERE id=?")
+      .bind(blockRow.drop_item_id).first<{ id: string }>();
+    dropId = known?.id ?? current;
+    dropQty = Math.min(99, Math.max(1, blockRow.drop_qty ?? 1));
+  } else {
+    const dropper = await env.DB.prepare(
+      "SELECT id FROM items WHERE place_block_id=? ORDER BY is_builtin DESC, id ASC LIMIT 1"
+    ).bind(current).first<{ id: string }>();
+    dropId = dropper?.id ?? current;
+    dropQty = 1;
+  }
+  if (dropId === current && !(await env.DB.prepare("SELECT id FROM items WHERE id=?").bind(current).first<{ id: string }>()))
+    dropId = null;
 
-  const stack = await env.DB.prepare("SELECT quantity FROM inventories WHERE user_id=? AND item_id=?").bind(auth.user.id, dropId).first<StackRow>();
+  const stack = dropId === null ? null
+    : await env.DB.prepare("SELECT quantity FROM inventories WHERE user_id=? AND item_id=?").bind(auth.user.id, dropId).first<StackRow>();
   if (stack && stack.quantity >= MAX_STACK)
     return json({ error: "That stack is full (999). Make room before breaking more.", code: "inventory_full" }, 400, origin);
 
@@ -1539,7 +1560,7 @@ async function handleBreak(request: Request, env: Env, origin: string | null): P
   await env.DB.batch([
     ...stackStatements(
       env, auth.user.id,
-      [{ item: dropId, qty: 1 }, ...contents, ...(run?.gives ?? [])],
+      [...(dropId === null ? [] : [{ item: dropId, qty: dropQty }]), ...contents, ...(run?.gives ?? [])],
       run?.takes ?? []
     ),
     env.DB.prepare(
@@ -1557,7 +1578,7 @@ async function handleBreak(request: Request, env: Env, origin: string | null): P
   // A hook's teleports and anchors belong to the player, not the dying cell.
   if (run) await applyScriptMoves(env, server, auth.user.id, auth.user.username, run.moves);
 
-  return json({ ok: true, x, y, z, dropped: dropId, contents, toasts: run?.toasts ?? [] }, 200, origin);
+  return json({ ok: true, x, y, z, dropped: dropId, drop_qty: dropQty, contents, toasts: run?.toasts ?? [] }, 200, origin);
 }
 
 // The admin's repair switch: re-run the edit table. D1's `world_edits` is the
@@ -2261,14 +2282,26 @@ export default {
         if (model.error) return err(model.error, 400, origin);
         const script = sanitizeScript(data.script);
         if (script.error) return err(script.error, 400, origin);
+        let dropItemId: string | null = null;
+        if (data.drop_item_id !== undefined && data.drop_item_id !== null &&
+            String(data.drop_item_id).trim() !== "") {
+          dropItemId = String(data.drop_item_id).trim();
+          const known = await env.DB.prepare("SELECT id FROM items WHERE id=?")
+            .bind(dropItemId).first<{ id: string }>();
+          if (!known) return err("Drop item must be a known item id.", 400, origin);
+        }
+        const dropQtyRaw = data.drop_qty === undefined || data.drop_qty === null || data.drop_qty === ""
+          ? 1 : Number(data.drop_qty);
+        if (!Number.isInteger(dropQtyRaw) || dropQtyRaw < 1 || dropQtyRaw > 99)
+          return err("Drop quantity must be an integer from 1 to 99.", 400, origin);
         // Registry ID: player:USERNAME:NAMESPACE:BLOCKNAME — the display name
         // (name) is separate, exactly like builtins (builtin:grass / "Grass").
         const fullId = `player:${auth.user.username.toLowerCase()}:${namespace.toLowerCase()}:${id.toLowerCase()}`;
         try {
           await env.DB.prepare(
-            "INSERT INTO blocks(id,name,creator_id,creator_name,hardness,light,colour,behaviour,rules_json,is_builtin,texture,texture_top,texture_bottom,model,script) VALUES(?,?,?,?,?,?,?,?,?,0,?,?,?,?,?)"
+            "INSERT INTO blocks(id,name,creator_id,creator_name,hardness,light,colour,behaviour,rules_json,is_builtin,texture,texture_top,texture_bottom,model,script,drop_item_id,drop_qty) VALUES(?,?,?,?,?,?,?,?,?,0,?,?,?,?,?,?,?)"
           ).bind(fullId, name, auth.user.id, auth.user.username, hardness, light, colour, behaviour, JSON.stringify(rules),
-            appearance.value, topFace.value, bottomFace.value, model.value, script.value).run();
+            appearance.value, topFace.value, bottomFace.value, model.value, script.value, dropItemId, dropQtyRaw).run();
         } catch {
           return err("That block ID already exists.", 409, origin);
         }
@@ -2308,10 +2341,22 @@ export default {
         if (model.error) return err(model.error, 400, origin);
         const script = sanitizeScript(data.script);
         if (script.error) return err(script.error, 400, origin);
+        let dropItemId: string | null = null;
+        if (data.drop_item_id !== undefined && data.drop_item_id !== null &&
+            String(data.drop_item_id).trim() !== "") {
+          dropItemId = String(data.drop_item_id).trim();
+          const known = await env.DB.prepare("SELECT id FROM items WHERE id=?")
+            .bind(dropItemId).first<{ id: string }>();
+          if (!known) return err("Drop item must be a known item id.", 400, origin);
+        }
+        const dropQtyRaw = data.drop_qty === undefined || data.drop_qty === null || data.drop_qty === ""
+          ? 1 : Number(data.drop_qty);
+        if (!Number.isInteger(dropQtyRaw) || dropQtyRaw < 1 || dropQtyRaw > 99)
+          return err("Drop quantity must be an integer from 1 to 99.", 400, origin);
         await env.DB.prepare(
-          "UPDATE blocks SET name=?,hardness=?,light=?,colour=?,behaviour=?,rules_json=?,texture=?,texture_top=?,texture_bottom=?,model=?,script=?,updated_at=CURRENT_TIMESTAMP WHERE id=?"
+          "UPDATE blocks SET name=?,hardness=?,light=?,colour=?,behaviour=?,rules_json=?,texture=?,texture_top=?,texture_bottom=?,model=?,script=?,drop_item_id=?,drop_qty=?,updated_at=CURRENT_TIMESTAMP WHERE id=?"
         ).bind(name, hardness, light, colour, behaviour, JSON.stringify(rules),
-          appearance.value, topFace.value, bottomFace.value, model.value, script.value, id).run();
+          appearance.value, topFace.value, bottomFace.value, model.value, script.value, dropItemId, dropQtyRaw, id).run();
         return json({ ok: true }, 200, origin);
       }
 
@@ -2327,7 +2372,10 @@ export default {
         if (existing.creator_id !== auth.user.id) return err("Only the creator can delete this block.", 403, origin);
         // Deleting a block cascades: its placed copies are restored to terrain
         // and referencing recipes are dropped, so "delete my test block" always
-        // works without manual world cleanup first.
+        // works without manual world cleanup first. The items that programmed it
+        // survive as unprogrammed — leaving `place_block_id` pointing at a dead
+        // row would abort the whole delete on the foreign key.
+        await env.DB.prepare("UPDATE items SET place_block_id=NULL WHERE place_block_id=?").bind(id).run();
         const placed = await env.DB.prepare(
           "SELECT x,y,z,server_id FROM world_edits WHERE block_id=?"
         ).bind(id).all<{ x: number; y: number; z: number; server_id: string }>();
@@ -2450,6 +2498,10 @@ export default {
         await env.DB.prepare("DELETE FROM inventories WHERE item_id=?").bind(id).run();
         await env.DB.prepare("DELETE FROM recipes WHERE result_id=? OR ingredients_json LIKE ?")
           .bind(id, `%"${id}"%`).run();
+        // A block that declared this item as its drop must not dangle: the row
+        // goes back to the implicit default (handleBreak also null-checks at
+        // break time — this is defence in depth, not the only line of guard).
+        await env.DB.prepare("UPDATE blocks SET drop_item_id=NULL WHERE drop_item_id=?").bind(id).run();
         await env.DB.prepare("DELETE FROM items WHERE id=?").bind(id).run();
         return json({
           ok: true,
