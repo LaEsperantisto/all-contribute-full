@@ -101,6 +101,20 @@ CREATE TABLE IF NOT EXISTS player_state (
   PRIMARY KEY (user_id, server_id)
 );
 
+-- The mob field, persisted per world (0031): the DO simulates in memory and
+-- flushes dirty rows every 5 s; a fresh object hydrates from here.
+CREATE TABLE IF NOT EXISTS mobs (
+  server_id TEXT NOT NULL,
+  mob_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  x REAL NOT NULL,
+  y REAL NOT NULL,
+  z REAL NOT NULL,
+  yaw REAL NOT NULL,
+  hp REAL NOT NULL,
+  PRIMARY KEY (server_id, mob_id)
+);
+
 -- Character appearance: persisted avatar colours, one row per user.
 CREATE TABLE IF NOT EXISTS player_appearance (
   user_id TEXT PRIMARY KEY REFERENCES users(id),

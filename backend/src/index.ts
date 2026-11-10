@@ -61,6 +61,9 @@ const HEALTH_RECHECK_MS = 2000;
 
 const MAX_MOBS = 12;
 const MOB_TICK_MS = 250;
+// D1 flush cadence for the mob field: at most one batch per world per 5 s
+// (worst case 12 rows) — ~17k batches/day/world ceiling; disclosed.
+const MOBS_SAVE_MS = 5000;
 // Crop batch cadence: how often stepCrops scans at all. The per-cell 20 s
 // age gate — not this — is what paces one stage per cell.
 const CROP_STEP_MS = 5000;
@@ -187,6 +190,13 @@ export class WorldLive extends DurableObject<Env> {
   // client reads the phase off its own wall clock).
   private clock: { phase: number | null; epoch: number; running: boolean } | null = null;
   mobs: Map<string, Mob> = new Map();
+  // The mob field's D1 mirror bookkeeping (0031): ids whose row changed or
+  // vanished since the last flush, whether this instance has hydrated yet,
+  // and when it last wrote. Memory stays the truth; D1 is the resume point.
+  private mobDirty = new Set<string>();
+  private mobGone = new Set<string>();
+  private mobsHydrated = false;
+  private mobsSaveAt = 0;
   // Lazily-filled caches that keep D1 reads tiny: column tops (short TTL)
   // and item stats (the registry is immutable for builtins).
   private columns: Map<string, { top: number; at: number }> = new Map();
@@ -377,6 +387,9 @@ export class WorldLive extends DurableObject<Env> {
     // A post-eviction tick has no request to bind with: re-read the stored id
     // so this world's mobs keep writing to their own scope.
     await this.bindServer(null);
+    // First tick after an eviction/wake: pull this world's field back out of
+    // D1 (0031), so a deploy does not reset the population to zero.
+    if (!this.mobsHydrated) await this.hydrateMobs();
     const now = Date.now();
     await this.ensureHealth();
     this.sweepStale(now);
@@ -392,6 +405,10 @@ export class WorldLive extends DurableObject<Env> {
     await this.flushHealth(now);
     await this.spawnOne(now);
     await this.stepCrops(now);
+    // Flush the mob field on the 5 s gate; the tick that finds nobody
+    // connected forces the flush, so an idle world still parks its field.
+    if (!this.sockets.length) this.mobsSaveAt = 0;
+    await this.flushMobs(now);
     if (this.sockets.length) await this.ctx.storage.setAlarm(Date.now() + MOB_TICK_MS);
   }
 
@@ -431,7 +448,7 @@ export class WorldLive extends DurableObject<Env> {
       for (const mob of this.mobs.values()) {
         let nearest = Infinity;
         for (const entry of watched) nearest = Math.min(nearest, Math.hypot(entry.x - mob.x, entry.z - mob.z));
-        if (nearest > MOB_DESPAWN_RANGE) this.mobs.delete(mob.id);
+        if (nearest > MOB_DESPAWN_RANGE) { this.mobs.delete(mob.id); this.mobGone.add(mob.id); }
       }
     }
     for (const mob of this.mobs.values()) {
@@ -476,6 +493,7 @@ export class WorldLive extends DurableObject<Env> {
         mob.yaw = mob.heading;
       }
       mob.y = (await this.columnTop(Math.floor(mob.x), Math.floor(mob.z))) + 1;
+      this.mobDirty.add(mob.id);
     }
   }
 
@@ -524,6 +542,62 @@ export class WorldLive extends DurableObject<Env> {
       nextThink: now + 3000 + Math.random() * 3000,
       nextAttack: 0
     });
+    this.mobDirty.add(id);
+  }
+
+  // Hydrate this world's mob field from D1 (0031) — once per instance, on
+  // the first alarm after wake. Failed hydration is not retried per tick
+  // (a D1 outage would otherwise storm every 250 ms); the population simply
+  // repopulates around players, as it did pre-0031.
+  private async hydrateMobs(): Promise<void> {
+    this.mobsHydrated = true;
+    try {
+      const { results } = await this.env.DB.prepare(
+        "SELECT mob_id,kind,x,y,z,yaw,hp FROM mobs WHERE server_id=? LIMIT ?"
+      ).bind(this.scope(), MAX_MOBS).all<{ mob_id: string; kind: string; x: number; y: number; z: number; yaw: number; hp: number }>();
+      const now = Date.now();
+      for (const r of results) {
+        const spec = MOB_SPECS[r.kind as MobKind];
+        if (!spec || this.mobs.size >= MAX_MOBS) continue;
+        this.mobs.set(r.mob_id, {
+          id: r.mob_id, kind: r.kind as MobKind, x: r.x, y: r.y, z: r.z,
+          yaw: r.yaw, hp: r.hp, hostile: spec.hostile,
+          heading: r.yaw,
+          nextThink: now + 1000 + Math.random() * 2000,
+          nextAttack: 0
+        });
+      }
+    } catch (error) {
+      console.error("Mob hydration failed:", error);
+    }
+  }
+
+  // One batched write of everything that moved or vanished since the last
+  // flush. Wrapped like stepCrops: a D1 hiccup backs off (the 5 s clock still
+  // advances, the next window flushes a bigger delta), it must not throw out
+  // of alarm() and take mobs AND crops down together.
+  private async flushMobs(now: number): Promise<void> {
+    if (now - this.mobsSaveAt < MOBS_SAVE_MS) return;
+    if (!this.mobDirty.size && !this.mobGone.size) return;
+    this.mobsSaveAt = now;
+    const gone = [...this.mobGone]; this.mobGone.clear();
+    const ids = [...this.mobDirty]; this.mobDirty.clear();
+    try {
+      const stmts = [];
+      for (const id of gone)
+        stmts.push(this.env.DB.prepare("DELETE FROM mobs WHERE server_id=? AND mob_id=?").bind(this.scope(), id));
+      for (const id of ids) {
+        const m = this.mobs.get(id);
+        if (!m) continue; // deleted without a row to delete (never spawned here)
+        stmts.push(this.env.DB.prepare(
+          `INSERT INTO mobs(server_id,mob_id,kind,x,y,z,yaw,hp) VALUES(?,?,?,?,?,?,?,?)
+           ON CONFLICT(server_id,mob_id) DO UPDATE SET kind=excluded.kind,x=excluded.x,y=excluded.y,z=excluded.z,yaw=excluded.yaw,hp=excluded.hp`
+        ).bind(this.scope(), id, m.kind, m.x, m.y, m.z, m.yaw, m.hp));
+      }
+      if (stmts.length) await this.env.DB.batch(stmts);
+    } catch (error) {
+      console.error("Mob flush failed:", error);
+    }
   }
 
   // Crops: batches every ~5 s, advancing at most 32 wheat cells one stage per
@@ -808,6 +882,7 @@ export class WorldLive extends DurableObject<Env> {
     mob.hp -= damage;
     if (mob.hp <= 0) {
       this.mobs.delete(mob.id);
+      this.mobGone.add(mob.id);
       // Kill reward: hostile drops a stick (crafting), pigs drop food.
       await this.creditInventory(entry.name, mob.hostile ? "builtin:stick" : "builtin:apple");
     }
@@ -1593,6 +1668,20 @@ async function handleBreak(request: Request, env: Env, origin: string | null): P
   if (!coords) return err(`Coordinates must be integers (x/z within ±1000000, y within 0..${WORLD_Y - 1}).`, 400, origin);
   const { x, y, z } = coords;
 
+  const cells = await resolveCells(env, server, [[x, y, z]]);
+  const current = cells.get(cellKey(x, y, z))!;
+  if (current === "air") return json({ error: "Nothing to break there.", code: "empty" }, 409, origin);
+
+  // Unbreakable is data, not a hardcoded bedrock line: any block whose
+  // hardness is beyond every honest tool (max speed 10 → 11 h + 0.25 s can
+  // never complete) refuses here. The client caps its bar and never POSTs;
+  // this is the refusal that makes that honest — and it sits BEFORE the rate
+  // gate, so poking bedrock is free and never spends the mining budget.
+  const preHard = await env.DB.prepare("SELECT hardness FROM blocks WHERE id=?")
+    .bind(current).first<{ hardness: number }>();
+  if (Number(preHard?.hardness) >= 500)
+    return json({ error: `${current} is unbreakable.`, code: "unbreakable" }, 400, origin);
+
   // The mining bar is only honest if the server refuses faster: per user, at
   // most one break every 200 ms — the client's shortest honest bar is 250 ms.
   const now = Date.now();
@@ -1601,10 +1690,6 @@ async function handleBreak(request: Request, env: Env, origin: string | null): P
     return json({ error: "Mining too fast — wait for the bar to finish.", code: "break_rate" }, 429, origin);
   breakTimes.set(auth.user.id, now);
   if (breakTimes.size > 5000) breakTimes.clear();
-
-  const cells = await resolveCells(env, server, [[x, y, z]]);
-  const current = cells.get(cellKey(x, y, z))!;
-  if (current === "air") return json({ error: "Nothing to break there.", code: "empty" }, 409, origin);
 
   // The credited drop is declared per block: an explicit drop_item_id (with
   // drop_qty, clamped 1..99) if set, otherwise the item that programmes this
