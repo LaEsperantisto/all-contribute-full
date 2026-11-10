@@ -1,0 +1,8 @@
+{
+  "name": "all-contrib",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "offline": "node scripts/offline.mjs"
+  }
+}
