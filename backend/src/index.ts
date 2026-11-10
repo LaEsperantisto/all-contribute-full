@@ -2546,7 +2546,7 @@ export default {
             "INSERT INTO blocks(id,name,creator_id,creator_name,hardness,light,colour,behaviour,rules_json,is_builtin,texture,texture_top,texture_bottom,model,script,drop_item_id,drop_qty,pass_through,climbable) VALUES(?,?,?,?,?,?,?,?,?,0,?,?,?,?,?,?,?,?,?)"
           ).bind(fullId, name, auth.user.id, auth.user.username, hardness, light, colour, behaviour, JSON.stringify(rules),
             appearance.value, topFace.value, bottomFace.value, model.value, script.value, dropItemId, dropQtyRaw,
-            data.pass_through ? 1 : 0, data.climbable ? 1 : 0).run();
+            (data.pass_through ? 1 : (data.climbable ? 1 : 0)), data.climbable ? 1 : 0).run();
         } catch {
           return err("That block ID already exists.", 409, origin);
         }
@@ -2602,7 +2602,7 @@ export default {
           "UPDATE blocks SET name=?,hardness=?,light=?,colour=?,behaviour=?,rules_json=?,texture=?,texture_top=?,texture_bottom=?,model=?,script=?,drop_item_id=?,drop_qty=?,pass_through=?,climbable=?,updated_at=CURRENT_TIMESTAMP WHERE id=?"
         ).bind(name, hardness, light, colour, behaviour, JSON.stringify(rules),
           appearance.value, topFace.value, bottomFace.value, model.value, script.value, dropItemId, dropQtyRaw,
-          data.pass_through ? 1 : 0, data.climbable ? 1 : 0, id).run();
+          (data.pass_through ? 1 : (data.climbable ? 1 : 0)), data.climbable ? 1 : 0, id).run();
         return json({ ok: true }, 200, origin);
       }
 
