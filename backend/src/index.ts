@@ -61,6 +61,9 @@ const HEALTH_RECHECK_MS = 2000;
 
 const MAX_MOBS = 12;
 const MOB_TICK_MS = 250;
+// Crop batch cadence: how often stepCrops scans at all. The per-cell 20 s
+// age gate — not this — is what paces one stage per cell.
+const CROP_STEP_MS = 5000;
 // Pose frames arrive four times a second from a visible tab. A hidden or
 // backgrounded tab is not: Chrome's intensive throttling reduces its timers
 // to roughly one wake-up a minute, so the window must sit past that — a real
@@ -523,32 +526,45 @@ export class WorldLive extends DurableObject<Env> {
     });
   }
 
-  // Crops: every ~20 s, advance at most 32 wheat cells one stage. A cell's
-  // created_at is the clock (every edit stamps it), so "20 s since it became
-  // this stage" needs no extra column. placed_by rides along from the row —
-  // growth is not a user edit (TEXT FK to users).
+  // Crops: batches every ~5 s, advancing at most 32 wheat cells one stage per
+  // batch. A cell's created_at is the clock (every edit stamps it), so the
+  // per-cell 20 s age gate enforces the pace — the outer gate is only a batch
+  // cadence. The old modulo lottery could phase-lock against the tick period
+  // and never fire; a last-run timestamp cannot. placed_by rides along from
+  // the row — growth is not a user edit (TEXT FK to users).
+  private lastCropStepAt = 0; // DO memory; post-eviction the first tick runs early — harmless at 32 cells
   private async stepCrops(now: number): Promise<void> {
-    if (!now || now % 20000 >= MOB_TICK_MS) return; // DO memory clock; hibernation-safe enough
+    if (!now || now - this.lastCropStepAt < CROP_STEP_MS) return;
+    this.lastCropStepAt = now;
     const { results } = await this.env.DB.prepare(
-      "SELECT x,y,z,block_id,placed_by FROM world_edits WHERE server_id=? AND block_id IN ('builtin:wheat_1','builtin:wheat_2','builtin:wheat_3') LIMIT 32"
+      "SELECT x,y,z,block_id,placed_by FROM world_edits WHERE server_id=? AND block_id IN ('builtin:wheat_1','builtin:wheat_2','builtin:wheat_3') ORDER BY created_at ASC LIMIT 32"
     ).bind(this.scope()).all<{ x: number; y: number; z: number; block_id: string; placed_by: string | null }>();
     for (const r of results) {
-      const aged = await this.env.DB.prepare(
-        "SELECT 1 AS stale FROM world_edits WHERE server_id=? AND x=? AND y=? AND z=? AND created_at > datetime('now','-20 seconds')"
-      ).bind(this.scope(), r.x, r.y, r.z).first();
-      if (aged) continue;
-      const next = "builtin:wheat_" + (Number(r.block_id.slice(-1)) + 1);
-      // Mirror the place-write shape (upsert + log + prune + publishEdit).
-      await this.env.DB.batch([
-        this.env.DB.prepare(
-          "INSERT INTO world_edits(server_id,x,y,z,block_id,placed_by) VALUES(?,?,?,?,?,?) ON CONFLICT(server_id,x,y,z) DO UPDATE SET block_id=excluded.block_id, created_at=CURRENT_TIMESTAMP"
-        ).bind(this.scope(), r.x, r.y, r.z, next, r.placed_by),
-        this.env.DB.prepare("INSERT INTO world_log(server_id,x,y,z,block_id) VALUES(?,?,?,?,?)")
-          .bind(this.scope(), r.x, r.y, r.z, next),
-        this.env.DB.prepare("DELETE FROM world_log WHERE server_id=? AND seq <= (SELECT MAX(seq) - ? FROM world_log WHERE server_id=?)")
-          .bind(this.scope(), WORLD_LOG_KEEP, this.scope()),
-      ]);
-      await publishEdit(this.env, this.scope(), r.x, r.y, r.z, next);
+      // One D1 hiccup must not throw out of alarm(): the retried alarm backs
+      // off and, once exhausted, freezes mobs AND crops together.
+      try {
+        const aged = await this.env.DB.prepare(
+          "SELECT 1 AS stale FROM world_edits WHERE server_id=? AND x=? AND y=? AND z=? AND created_at > datetime('now','-20 seconds')"
+        ).bind(this.scope(), r.x, r.y, r.z).first();
+        if (aged) continue;
+        const next = "builtin:wheat_" + (Number(r.block_id.slice(-1)) + 1);
+        // Mirror the place-write shape (upsert + log + prune + publishEdit).
+        // A beam cannot survive the rewrite of its own cell.
+        await this.env.DB.batch([
+          this.env.DB.prepare(
+            "INSERT INTO world_edits(server_id,x,y,z,block_id,placed_by) VALUES(?,?,?,?,?,?) ON CONFLICT(server_id,x,y,z) DO UPDATE SET block_id=excluded.block_id, created_at=CURRENT_TIMESTAMP"
+          ).bind(this.scope(), r.x, r.y, r.z, next, r.placed_by),
+          this.env.DB.prepare("INSERT INTO world_log(server_id,x,y,z,block_id) VALUES(?,?,?,?,?)")
+            .bind(this.scope(), r.x, r.y, r.z, next),
+          this.env.DB.prepare("DELETE FROM world_log WHERE server_id=? AND seq <= (SELECT MAX(seq) - ? FROM world_log WHERE server_id=?)")
+            .bind(this.scope(), WORLD_LOG_KEEP, this.scope()),
+          this.env.DB.prepare("DELETE FROM block_beams WHERE server_id=? AND x=? AND y=? AND z=?")
+            .bind(this.scope(), r.x, r.y, r.z),
+        ]);
+        await publishEdit(this.env, this.scope(), r.x, r.y, r.z, next);
+      } catch (error) {
+        console.error("crop step failed:", error);
+      }
     }
   }
 
