@@ -7,7 +7,7 @@
 // floor, air above. Each (x, z) column comes from a height field plus
 // deterministic trees and caves — identical in the Worker and the browser.
 
-export const WORLD_Y = 32; // legal solid band is y ∈ [0, 31]
+export const WORLD_Y = 64; // legal solid band is y ∈ [0, 63]
 export const SEA_LEVEL = 10; // columns with heightAt < this flood up to y=SEA_LEVEL
 
 function hashU32(n: number): number {

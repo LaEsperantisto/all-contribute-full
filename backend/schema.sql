@@ -48,10 +48,12 @@ CREATE TABLE IF NOT EXISTS recipes (
 
 CREATE TABLE IF NOT EXISTS inventories (
   user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  server_id TEXT NOT NULL DEFAULT 'global',
   item_id TEXT NOT NULL,
   quantity INTEGER NOT NULL CHECK(quantity >= 0 AND quantity <= 999),
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  PRIMARY KEY (user_id, item_id)
+  ord INTEGER,
+  PRIMARY KEY (user_id, server_id, item_id)
 );
 
 -- The shared world: base terrain is a deterministic function of coordinates

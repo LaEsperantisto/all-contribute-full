@@ -833,10 +833,10 @@ export class WorldLive extends DurableObject<Env> {
   private async creditInventory(username: string, itemId: string): Promise<void> {
     try {
       await this.env.DB.prepare(
-        `INSERT INTO inventories(user_id,item_id,quantity)
-         SELECT id, ?, 1 FROM users WHERE username = ?
-         ON CONFLICT(user_id,item_id) DO UPDATE SET quantity=min(999, quantity+1), updated_at=CURRENT_TIMESTAMP`
-      ).bind(itemId, username).run();
+        `INSERT INTO inventories(user_id,server_id,item_id,quantity)
+         SELECT id, ?, ?, 1 FROM users WHERE username = ?
+         ON CONFLICT(user_id,server_id,item_id) DO UPDATE SET quantity=min(999, quantity+1), updated_at=CURRENT_TIMESTAMP`
+      ).bind(this.serverId, itemId, username).run();
     } catch (error) {
       console.error("Kill credit failed:", error);
     }
@@ -1170,32 +1170,54 @@ async function livePlayers(env: Env, server: string): Promise<number> {
 // Placement semantics (ADR 0001): declarative rules only for now; executable
 // player behaviour versions alongside these later. Malformed rules NEVER throw:
 // they degrade to plain placement so one bad blob cannot crash the engine.
-type SupportRule = "any" | "solid" | "none";
-type BlockRules = { support: SupportRule; incompatibleWith: string[] };
-const supports: string[] = ["any", "solid", "none"];
+type BelowRule = "any" | "whitelist" | "blacklist";
+type BlockRules = { below: BelowRule; belowIds: string[]; incompatibleWith: string[] };
+const belowRules: string[] = ["any", "whitelist", "blacklist"];
+const belowRuleOk = (v: unknown): v is BelowRule => belowRules.includes(String(v));
+// "air" and "solid" are tokens inside belowIds: air is the empty-below case,
+// solid means "any block that bodies collide with" (anything but air and the
+// pass-through registry set).
+const belowTokenOk = (id: unknown): id is string =>
+  typeof id === "string" && (id === "air" || id === "solid" || validItemId(id));
 
 function parseRules(raw: unknown): BlockRules {
   try {
     const value = typeof raw === "string" ? JSON.parse(raw) : raw && typeof raw === "object" ? raw : {};
+    // Legacy any/solid/none rows are mapped on READ — no data migration, and
+    // a cached old Studio page that still POSTs `support` keeps working.
+    let below: BelowRule = "any";
+    let belowIds: string[] = [];
+    if (belowRuleOk(value.below)) below = value.below;
+    else if (value.support === "solid") { below = "whitelist"; belowIds = ["solid"]; }
+    else if (value.support === "none") { below = "whitelist"; belowIds = ["air"]; }
+    if (Array.isArray(value.belowIds))
+      belowIds = value.belowIds.filter(belowTokenOk).slice(0, 64);
     return {
       // Floating placement is the norm here: a block dropped into mid-air
       // stays. Blocks that genuinely need the ground say so in rules_json.
-      support: supports.includes(value.support) ? value.support : "any",
+      below,
+      belowIds,
       incompatibleWith: Array.isArray(value.incompatibleWith)
         ? value.incompatibleWith.filter((id: unknown) => typeof id === "string" && validItemId(id)).slice(0, 32)
         : []
     };
   } catch {
-    return { support: "any", incompatibleWith: [] };
+    return { below: "any", belowIds: [], incompatibleWith: [] };
   }
 }
 
 function rulesFromInput(raw: unknown): { rules: BlockRules; error: string | null } {
   if (raw === undefined || raw === null) return { rules: parseRules({}), error: null };
   if (typeof raw !== "object" || Array.isArray(raw)) return { rules: parseRules({}), error: "rules must be an object." };
-  const value = raw as { support?: unknown; incompatibleWith?: unknown };
-  if (value.support !== undefined && !supports.includes(String(value.support)))
-    return { rules: parseRules({}), error: "rules.support must be one of: any, solid, none." };
+  const value = raw as { below?: unknown; belowIds?: unknown; support?: unknown; incompatibleWith?: unknown };
+  if (value.below !== undefined && !belowRuleOk(value.below))
+    return { rules: parseRules({}), error: "rules.below must be one of: any, whitelist, blacklist." };
+  if (
+    value.belowIds !== undefined &&
+    (!Array.isArray(value.belowIds) || value.belowIds.length > 64 ||
+      value.belowIds.some(id => !belowTokenOk(id)))
+  )
+    return { rules: parseRules({}), error: "rules.belowIds must be an array of up to 64 valid item IDs (the tokens \"air\" and \"solid\" count too)." };
   if (
     value.incompatibleWith !== undefined &&
     (!Array.isArray(value.incompatibleWith) || value.incompatibleWith.length > 32 ||
@@ -1206,6 +1228,9 @@ function rulesFromInput(raw: unknown): { rules: BlockRules; error: string | null
 }
 
 const cellKey = (x: number, y: number, z: number) => `${x},${y},${z}`;
+// Per-user break timestamps for the mining-bar rate gate; pruned wholesale
+// when it grows past a few thousand players — it is a throttle, not a ledger.
+const breakTimes = new Map<string, number>();
 
 type EditRow = { x: number; y: number; z: number; block_id: string };
 
@@ -1340,6 +1365,7 @@ type BlockRow = {
   model: string | null; script: string | null;
   drop_item_id: string | null; drop_qty: number;
   pass_through: number;
+  climbable: number;
 };
 
 // The voxel models the renderer actually ships (vlox hardcodes the list; an
@@ -1379,7 +1405,7 @@ function sanitizeScript(raw: unknown): { value: string | null; error: string | n
 
 async function listBlocks(env: Env): Promise<unknown[]> {
   const { results } = await env.DB.prepare(
-    "SELECT id,name,creator_name AS creator,hardness,light,colour,behaviour,rules_json,is_builtin,texture,texture_top,texture_bottom,model,script,drop_item_id,drop_qty,pass_through FROM blocks ORDER BY is_builtin DESC,name LIMIT 500"
+    "SELECT id,name,creator_name AS creator,hardness,light,colour,behaviour,rules_json,is_builtin,texture,texture_top,texture_bottom,model,script,drop_item_id,drop_qty,pass_through,climbable FROM blocks ORDER BY is_builtin DESC,name LIMIT 500"
   ).all<BlockRow>();
   return results.map(row => ({
     id: row.id, name: row.name, creator: row.creator, hardness: row.hardness, light: row.light,
@@ -1387,7 +1413,8 @@ async function listBlocks(env: Env): Promise<unknown[]> {
     texture: row.texture ?? null, texture_top: row.texture_top ?? null, texture_bottom: row.texture_bottom ?? null,
     model: row.model ?? null, script: row.script ?? null,
     drop_item_id: row.drop_item_id ?? null, drop_qty: row.drop_qty ?? 1,
-    pass_through: row.pass_through ?? 0
+    pass_through: row.pass_through ?? 0,
+    climbable: row.climbable ?? 0
   }));
 }
 
@@ -1502,10 +1529,23 @@ async function handlePlace(request: Request, env: Env, origin: string | null): P
 
   if (cells.get(cellKey(x, y, z)) !== "air")
     return json({ error: "That cell is already occupied.", code: "occupied" }, 409, origin);
-  if (rules.support === "solid" && cells.get(cellKey(x, y - 1, z)) === "air")
-    return json({ error: `${def.id} can only be placed on a solid surface.`, code: "no_support" }, 400, origin);
-  if (rules.support === "none" && cells.get(cellKey(x, y - 1, z)) !== "air")
-    return json({ error: `${def.id} needs empty space beneath it.`, code: "no_support" }, 400, origin);
+  // The "solid" token means "anything bodies collide with": anything but air
+  // and the pass-through registry set. One small query, only when a rule is
+  // actually set — same query shape columnTop already uses.
+  let passThru = new Set<string>();
+  if (rules.below !== "any" && rules.belowIds.includes("solid")) {
+    const pt = await env.DB.prepare("SELECT id FROM blocks WHERE pass_through=1").all<{ id: string }>();
+    passThru = new Set(pt.results.map(r => r.id));
+  }
+  const belowId = cells.get(cellKey(x, y - 1, z))!;
+  // A listed id matches the cell below literally, and the "solid" token in
+  // belowIds matches any occupant that bodies collide with.
+  const listed = rules.belowIds.includes(belowId) ||
+    (rules.belowIds.includes("solid") && belowId !== "air" && !passThru.has(belowId));
+  if (rules.below === "whitelist" && !listed)
+    return json({ error: `${def.id} can only be placed on: ${rules.belowIds.join(", ")}.`, code: "no_support" }, 400, origin);
+  if (rules.below === "blacklist" && listed)
+    return json({ error: `${def.id} refuses to sit on ${belowId}.`, code: "no_support" }, 400, origin);
   for (const [nx, ny, nz] of neighbours) {
     const neighbour = cells.get(cellKey(nx, ny, nz))!;
     if (rules.incompatibleWith.includes(neighbour))
@@ -1516,8 +1556,8 @@ async function handlePlace(request: Request, env: Env, origin: string | null): P
   }
 
   const debit = await env.DB.prepare(
-    "UPDATE inventories SET quantity=quantity-1, updated_at=CURRENT_TIMESTAMP WHERE user_id=? AND item_id=? AND quantity>=1"
-  ).bind(auth.user.id, itemId).run();
+    "UPDATE inventories SET quantity=quantity-1, updated_at=CURRENT_TIMESTAMP WHERE user_id=? AND server_id=? AND item_id=? AND quantity>=1"
+  ).bind(auth.user.id, server, itemId).run();
   if (!debit.meta.changes)
     return json({ error: `You have no ${itemId} in your inventory.`, code: "no_item" }, 400, origin);
 
@@ -1553,11 +1593,18 @@ async function handleBreak(request: Request, env: Env, origin: string | null): P
   if (!coords) return err(`Coordinates must be integers (x/z within ±1000000, y within 0..${WORLD_Y - 1}).`, 400, origin);
   const { x, y, z } = coords;
 
+  // The mining bar is only honest if the server refuses faster: per user, at
+  // most one break every 200 ms — the client's shortest honest bar is 250 ms.
+  const now = Date.now();
+  const lastBreak = breakTimes.get(auth.user.id) ?? 0;
+  if (now - lastBreak < 200)
+    return json({ error: "Mining too fast — wait for the bar to finish.", code: "break_rate" }, 429, origin);
+  breakTimes.set(auth.user.id, now);
+  if (breakTimes.size > 5000) breakTimes.clear();
+
   const cells = await resolveCells(env, server, [[x, y, z]]);
   const current = cells.get(cellKey(x, y, z))!;
   if (current === "air") return json({ error: "Nothing to break there.", code: "empty" }, 409, origin);
-  if (current === "builtin:bedrock")
-    return json({ error: "Bedrock is unbreakable.", code: "unbreakable" }, 400, origin);
 
   // The credited drop is declared per block: an explicit drop_item_id (with
   // drop_qty, clamped 1..99) if set, otherwise the item that programmes this
@@ -1566,8 +1613,14 @@ async function handleBreak(request: Request, env: Env, origin: string | null): P
   // too. If the fallback id has no item row at all (base-terrain-only blocks
   // like water), credit NOTHING rather than leak a phantom stack.
   const blockRow = await env.DB.prepare(
-    "SELECT drop_item_id, drop_qty FROM blocks WHERE id=?"
-  ).bind(current).first<{ drop_item_id: string | null; drop_qty: number }>();
+    "SELECT drop_item_id, drop_qty, hardness FROM blocks WHERE id=?"
+  ).bind(current).first<{ drop_item_id: string | null; drop_qty: number; hardness: number }>();
+  // Unbreakable is data, not a hardcoded bedrock line: any block whose
+  // hardness is beyond every honest tool (max speed 10 → 11 h + 0.25 s can
+  // never complete) refuses here. The client caps its bar and never POSTs;
+  // this is the refusal that makes that honest.
+  if (Number(blockRow?.hardness) >= 500)
+    return json({ error: `${current} is unbreakable.`, code: "unbreakable" }, 400, origin);
   let dropId: string | null;
   let dropQty: number;
   if (blockRow?.drop_item_id) {
@@ -1586,7 +1639,7 @@ async function handleBreak(request: Request, env: Env, origin: string | null): P
     dropId = null;
 
   const stack = dropId === null ? null
-    : await env.DB.prepare("SELECT quantity FROM inventories WHERE user_id=? AND item_id=?").bind(auth.user.id, dropId).first<StackRow>();
+    : await env.DB.prepare("SELECT quantity FROM inventories WHERE user_id=? AND server_id=? AND item_id=?").bind(auth.user.id, server, dropId).first<StackRow>();
   if (stack && stack.quantity >= MAX_STACK)
     return json({ error: "That stack is full (999). Make room before breaking more.", code: "inventory_full" }, 400, origin);
 
@@ -1607,7 +1660,7 @@ async function handleBreak(request: Request, env: Env, origin: string | null): P
     for (const row of rows.results) values.set(row.key, stateValue(row.value));
     const [inv, stacks, pos] = await Promise.all([
       loadBlockInventory(env, server, x, y, z),
-      loadStacks(env, auth.user.id),
+      loadStacks(env, auth.user.id, server),
       loadPlayerPosition(env, server, auth.user.id)
     ]);
     run = runBlockScript(
@@ -1638,7 +1691,7 @@ async function handleBreak(request: Request, env: Env, origin: string | null): P
   // together, and takes the column down on every connected client.
   await env.DB.batch([
     ...stackStatements(
-      env, auth.user.id,
+      env, auth.user.id, server,
       [...(dropId === null ? [] : [{ item: dropId, qty: dropQty }]), ...contents, ...(run?.gives ?? [])],
       run?.takes ?? []
     ),
@@ -1745,9 +1798,9 @@ async function loadBlockInventory(env: Env, server: string, x: number, y: number
   return inv;
 }
 
-async function loadStacks(env: Env, userId: string): Promise<Map<string, number>> {
-  const { results } = await env.DB.prepare("SELECT item_id,quantity FROM inventories WHERE user_id=?")
-    .bind(userId).all<{ item_id: string; quantity: number }>();
+async function loadStacks(env: Env, userId: string, server: string): Promise<Map<string, number>> {
+  const { results } = await env.DB.prepare("SELECT item_id,quantity FROM inventories WHERE user_id=? AND server_id=?")
+    .bind(userId, server).all<{ item_id: string; quantity: number }>();
   const stacks = new Map<string, number>();
   for (const row of results) stacks.set(row.item_id, Number(row.quantity));
   return stacks;
@@ -1786,6 +1839,7 @@ function storeStatements(
 function stackStatements(
   env: Env,
   userId: string,
+  server: string,
   gives: { item: string; qty: number }[],
   takes: { item: string; qty: number }[]
 ): D1PreparedStatement[] {
@@ -1796,12 +1850,12 @@ function stackStatements(
   for (const [item, d] of delta) {
     if (d > 0) {
       stmts.push(env.DB.prepare(
-        "INSERT INTO inventories(user_id,item_id,quantity) VALUES(?,?,?) ON CONFLICT(user_id,item_id) DO UPDATE SET quantity=MIN(?,quantity+?), updated_at=CURRENT_TIMESTAMP"
-      ).bind(userId, item, Math.min(MAX_STACK, d), MAX_STACK, d));
+        "INSERT INTO inventories(user_id,server_id,item_id,quantity) VALUES(?,?,?,?) ON CONFLICT(user_id,server_id,item_id) DO UPDATE SET quantity=MIN(?,quantity+?), updated_at=CURRENT_TIMESTAMP"
+      ).bind(userId, server, item, Math.min(MAX_STACK, d), MAX_STACK, d));
     } else if (d < 0) {
       stmts.push(env.DB.prepare(
-        "UPDATE inventories SET quantity=MAX(0,quantity+?), updated_at=CURRENT_TIMESTAMP WHERE user_id=? AND item_id=?"
-      ).bind(d, userId, item));
+        "UPDATE inventories SET quantity=MAX(0,quantity+?), updated_at=CURRENT_TIMESTAMP WHERE user_id=? AND server_id=? AND item_id=?"
+      ).bind(d, userId, server, item));
     }
   }
   return stmts;
@@ -1876,7 +1930,7 @@ async function handleBlockInteract(request: Request, env: Env, origin: string | 
   // the acting player's position and stacks, and this cell's own store.
   const [inv, stacks, pos] = await Promise.all([
     loadBlockInventory(env, server, x, y, z),
-    loadStacks(env, auth.user.id),
+    loadStacks(env, auth.user.id, server),
     loadPlayerPosition(env, server, auth.user.id)
   ]);
 
@@ -1902,7 +1956,7 @@ async function handleBlockInteract(request: Request, env: Env, origin: string | 
     ).bind(server, x, y, z, k, String(v)));
   }
   flush.push(...storeStatements(env, server, x, y, z, outcome.stored));
-  flush.push(...stackStatements(env, auth.user.id, outcome.gives, outcome.takes));
+  flush.push(...stackStatements(env, auth.user.id, server, outcome.gives, outcome.takes));
   flush.push(env.DB.prepare("DELETE FROM block_beams WHERE server_id=? AND x=? AND y=? AND z=?").bind(server, x, y, z));
   const beams: string[] = [];
   for (const beam of outcome.beams) {
@@ -2006,8 +2060,9 @@ async function handlePostPlayerAppearance(request: Request, env: Env, origin: st
 async function handleCraft(request: Request, env: Env, origin: string | null): Promise<Response> {
   const auth = await authenticate(request, env);
   if (!auth) return err("Log in first.", 401, origin);
-  const data = await body<{ recipe_id: unknown }>(request);
+  const data = await body<{ recipe_id: unknown; server?: unknown }>(request);
   const recipeId = typeof data.recipe_id === "string" ? data.recipe_id : "";
+  const server = serverOf(request, data.server);
   if (!/^[0-9a-f-]{36}$/i.test(recipeId)) return err("Invalid recipe id.", 400, origin);
 
   const recipe = await env.DB.prepare("SELECT id,name,ingredients_json,result_id,quantity FROM recipes WHERE id=?").bind(recipeId).first<RecipeRow>();
@@ -2027,8 +2082,8 @@ async function handleCraft(request: Request, env: Env, origin: string | null): P
   }
 
   const invRows = await env.DB
-    .prepare("SELECT item_id, quantity FROM inventories WHERE user_id=?")
-    .bind(auth.user.id)
+    .prepare("SELECT item_id, quantity FROM inventories WHERE user_id=? AND server_id=?")
+    .bind(auth.user.id, server)
     .all<{ item_id: string; quantity: number }>();
   const have = new Map(invRows.results.map(row => [row.item_id, row.quantity]));
   for (const [id, need] of required) {
@@ -2039,11 +2094,11 @@ async function handleCraft(request: Request, env: Env, origin: string | null): P
     return json({ error: "The result stack would exceed 999. Make room first.", code: "inventory_full" }, 400, origin);
 
   const statements = [...required].map(([id, need]) =>
-    env.DB.prepare("UPDATE inventories SET quantity=quantity-?, updated_at=CURRENT_TIMESTAMP WHERE user_id=? AND item_id=? AND quantity>=?")
-      .bind(need, auth.user.id, id, need));
+    env.DB.prepare("UPDATE inventories SET quantity=quantity-?, updated_at=CURRENT_TIMESTAMP WHERE user_id=? AND server_id=? AND item_id=? AND quantity>=?")
+      .bind(need, auth.user.id, server, id, need));
   statements.push(env.DB.prepare(
-    "INSERT INTO inventories(user_id,item_id,quantity) VALUES(?,?,?) ON CONFLICT(user_id,item_id) DO UPDATE SET quantity=quantity+?, updated_at=CURRENT_TIMESTAMP"
-  ).bind(auth.user.id, recipe.result_id, recipe.quantity, recipe.quantity));
+    "INSERT INTO inventories(user_id,server_id,item_id,quantity) VALUES(?,?,?,?) ON CONFLICT(user_id,server_id,item_id) DO UPDATE SET quantity=quantity+?, updated_at=CURRENT_TIMESTAMP"
+  ).bind(auth.user.id, server, recipe.result_id, recipe.quantity, recipe.quantity));
   await env.DB.batch(statements);
   return json({ ok: true, id: recipe.result_id, quantity: recipe.quantity }, 200, origin);
 }
@@ -2124,10 +2179,10 @@ async function handleEat(request: Request, env: Env, origin: string | null): Pro
   const item = await env.DB.prepare("SELECT kind, heal FROM items WHERE id=?").bind(itemId).first<{ kind: string; heal: number }>();
   if (!item || item.kind !== "food" || !(item.heal > 0)) return err(`You cannot eat ${itemId}.`, 400, origin);
   const debit = await env.DB.prepare(
-    "UPDATE inventories SET quantity=quantity-1, updated_at=CURRENT_TIMESTAMP WHERE user_id=? AND item_id=? AND quantity>=1"
-  ).bind(auth.user.id, itemId).run();
+    "UPDATE inventories SET quantity=quantity-1, updated_at=CURRENT_TIMESTAMP WHERE user_id=? AND server_id=? AND item_id=? AND quantity>=1"
+  ).bind(auth.user.id, server, itemId).run();
   if (!debit.meta.changes) return err(`You have no ${itemId} to eat.`, 400, origin);
-  await env.DB.prepare("DELETE FROM inventories WHERE user_id=? AND item_id=? AND quantity<=0").bind(auth.user.id, itemId).run();
+  await env.DB.prepare("DELETE FROM inventories WHERE user_id=? AND server_id=? AND item_id=? AND quantity<=0").bind(auth.user.id, server, itemId).run();
   const row = await env.DB.prepare("SELECT health FROM player_state WHERE user_id=? AND server_id=?").bind(auth.user.id, server).first<{ health: number }>();
   const current = row ? Math.max(0, Math.min(MAX_HEALTH, Number(row.health) || 0)) : MAX_HEALTH;
   const health = Math.min(MAX_HEALTH, current + item.heal);
@@ -2403,10 +2458,10 @@ export default {
         const fullId = `player:${auth.user.username.toLowerCase()}:${namespace.toLowerCase()}:${id.toLowerCase()}`;
         try {
           await env.DB.prepare(
-            "INSERT INTO blocks(id,name,creator_id,creator_name,hardness,light,colour,behaviour,rules_json,is_builtin,texture,texture_top,texture_bottom,model,script,drop_item_id,drop_qty,pass_through) VALUES(?,?,?,?,?,?,?,?,?,0,?,?,?,?,?,?,?,?)"
+            "INSERT INTO blocks(id,name,creator_id,creator_name,hardness,light,colour,behaviour,rules_json,is_builtin,texture,texture_top,texture_bottom,model,script,drop_item_id,drop_qty,pass_through,climbable) VALUES(?,?,?,?,?,?,?,?,?,0,?,?,?,?,?,?,?,?,?)"
           ).bind(fullId, name, auth.user.id, auth.user.username, hardness, light, colour, behaviour, JSON.stringify(rules),
             appearance.value, topFace.value, bottomFace.value, model.value, script.value, dropItemId, dropQtyRaw,
-            data.pass_through ? 1 : 0).run();
+            data.pass_through ? 1 : 0, data.climbable ? 1 : 0).run();
         } catch {
           return err("That block ID already exists.", 409, origin);
         }
@@ -2459,10 +2514,10 @@ export default {
         if (!Number.isInteger(dropQtyRaw) || dropQtyRaw < 1 || dropQtyRaw > 99)
           return err("Drop quantity must be an integer from 1 to 99.", 400, origin);
         await env.DB.prepare(
-          "UPDATE blocks SET name=?,hardness=?,light=?,colour=?,behaviour=?,rules_json=?,texture=?,texture_top=?,texture_bottom=?,model=?,script=?,drop_item_id=?,drop_qty=?,pass_through=?,updated_at=CURRENT_TIMESTAMP WHERE id=?"
+          "UPDATE blocks SET name=?,hardness=?,light=?,colour=?,behaviour=?,rules_json=?,texture=?,texture_top=?,texture_bottom=?,model=?,script=?,drop_item_id=?,drop_qty=?,pass_through=?,climbable=?,updated_at=CURRENT_TIMESTAMP WHERE id=?"
         ).bind(name, hardness, light, colour, behaviour, JSON.stringify(rules),
           appearance.value, topFace.value, bottomFace.value, model.value, script.value, dropItemId, dropQtyRaw,
-          data.pass_through ? 1 : 0, id).run();
+          data.pass_through ? 1 : 0, data.climbable ? 1 : 0, id).run();
         return json({ ok: true }, 200, origin);
       }
 
@@ -2851,8 +2906,8 @@ export default {
         // Arranged stacks first, in the order the player dragged them into;
         // everything else falls back to ID order (the pre-drag behaviour).
         const { results } = await env.DB
-          .prepare("SELECT item_id, quantity FROM inventories WHERE user_id=? AND quantity>0 ORDER BY (ord IS NULL), ord, item_id")
-          .bind(auth.user.id).all<{ item_id: string; quantity: number }>();
+          .prepare("SELECT item_id, quantity FROM inventories WHERE user_id=? AND server_id=? AND quantity>0 ORDER BY (ord IS NULL), ord, item_id")
+          .bind(auth.user.id, serverOf(request)).all<{ item_id: string; quantity: number }>();
         return json({ inventory: results }, 200, origin);
       }
 
@@ -2872,8 +2927,8 @@ export default {
           ids.push(id);
         }
         const owned = await env.DB
-          .prepare("SELECT item_id FROM inventories WHERE user_id=? AND quantity>0")
-          .bind(auth.user.id).all<{ item_id: string }>();
+          .prepare("SELECT item_id FROM inventories WHERE user_id=? AND server_id=? AND quantity>0")
+          .bind(auth.user.id, serverOf(request)).all<{ item_id: string }>();
         const have = new Set(owned.results.map((r) => r.item_id));
         const cases: string[] = [];
         const binds: (string | number | null)[] = [];
@@ -2890,8 +2945,8 @@ export default {
           binds.push(id, null);
         }
         await env.DB
-          .prepare(`UPDATE inventories SET ord = CASE item_id ${cases.join(" ")} ELSE NULL END WHERE user_id=?`)
-          .bind(...binds, auth.user.id).run();
+          .prepare(`UPDATE inventories SET ord = CASE item_id ${cases.join(" ")} ELSE NULL END WHERE user_id=? AND server_id=?`)
+          .bind(...binds, auth.user.id, serverOf(request)).run();
         return json({ ok: true }, 200, origin);
       }
 
@@ -2902,23 +2957,24 @@ export default {
         // through the world (mining, mobs, crafting), never by editing numbers.
         // The client hides these controls; this is the authority behind that.
         if (!isAdminUser(auth.user.username)) return err("Only the admin account can change inventory counts.", 403, origin);
-        const data = await body<{ item_id: unknown; quantity: unknown }>(request);
+        const data = await body<{ item_id: unknown; quantity: unknown; server?: unknown }>(request);
         const itemId = typeof data.item_id === "string" ? data.item_id.trim().toLowerCase() : "";
         const quantity = Number(data.quantity);
+        const server = serverOf(request, data.server);
         if (!validItemId(itemId)) return err("Use 1–48 letters, numbers, underscores, colons or hyphens for the item ID.", 400, origin);
         if (!Number.isInteger(quantity) || quantity < 1 || quantity > 999) return err("Quantity must be between 1 and 999.", 400, origin);
         if (path === "/api/inventory/add") {
           const known = await env.DB.prepare("SELECT id FROM items WHERE id=?").bind(itemId).first();
           if (!known) return err("Unknown item ID.", 400, origin);
           await env.DB.prepare(
-            "INSERT INTO inventories(user_id,item_id,quantity) VALUES(?,?,?) ON CONFLICT(user_id,item_id) DO UPDATE SET quantity=min(999, quantity+?), updated_at=CURRENT_TIMESTAMP"
-          ).bind(auth.user.id, itemId, quantity, quantity).run();
+            "INSERT INTO inventories(user_id,server_id,item_id,quantity) VALUES(?,?,?,?) ON CONFLICT(user_id,server_id,item_id) DO UPDATE SET quantity=min(999, quantity+?), updated_at=CURRENT_TIMESTAMP"
+          ).bind(auth.user.id, server, itemId, quantity, quantity).run();
         } else {
           const removed = await env.DB.prepare(
-            "UPDATE inventories SET quantity=quantity-?, updated_at=CURRENT_TIMESTAMP WHERE user_id=? AND item_id=? AND quantity>=?"
-          ).bind(quantity, auth.user.id, itemId, quantity).run();
+            "UPDATE inventories SET quantity=quantity-?, updated_at=CURRENT_TIMESTAMP WHERE user_id=? AND server_id=? AND item_id=? AND quantity>=?"
+          ).bind(quantity, auth.user.id, server, itemId, quantity).run();
           if (!removed.meta.changes) return err(`You do not have ${quantity} × ${itemId}.`, 400, origin);
-          await env.DB.prepare("DELETE FROM inventories WHERE user_id=? AND item_id=? AND quantity<=0").bind(auth.user.id, itemId).run();
+          await env.DB.prepare("DELETE FROM inventories WHERE user_id=? AND server_id=? AND item_id=? AND quantity<=0").bind(auth.user.id, server, itemId).run();
         }
         return json({ ok: true }, 200, origin);
       }
@@ -2927,7 +2983,7 @@ export default {
         const auth = await authenticate(request, env);
         if (!auth) return err("Log in first.", 401, origin);
         if (!isAdminUser(auth.user.username)) return err("Only the admin account can clear an inventory.", 403, origin);
-        await env.DB.prepare("DELETE FROM inventories WHERE user_id=?").bind(auth.user.id).run();
+        await env.DB.prepare("DELETE FROM inventories WHERE user_id=? AND server_id=?").bind(auth.user.id, serverOf(request, (await body<{ server?: unknown }>(request)).server)).run();
         return json({ ok: true }, 200, origin);
       }
 
