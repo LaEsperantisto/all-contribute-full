@@ -563,7 +563,7 @@ export class WorldLive extends DurableObject<Env> {
     let top = Math.max(heightAt(x, z), SEA_LEVEL);
     try {
       const { results } = await this.env.DB
-        .prepare("SELECT y, block_id FROM world_edits WHERE server_id=? AND x=? AND z=?")
+        .prepare("SELECT y, block_id FROM world_edits WHERE server_id=? AND x=? AND z=? AND block_id NOT IN (SELECT id FROM blocks WHERE pass_through=1)")
         .bind(this.scope(), x, z).all<{ y: number; block_id: string }>();
       for (const edit of results)
         if (edit.block_id !== "air" && edit.y > top) top = edit.y;
@@ -1323,6 +1323,7 @@ type BlockRow = {
   texture: string | null; texture_top: string | null; texture_bottom: string | null;
   model: string | null; script: string | null;
   drop_item_id: string | null; drop_qty: number;
+  pass_through: number;
 };
 
 // The voxel models the renderer actually ships (vlox hardcodes the list; an
@@ -1362,14 +1363,15 @@ function sanitizeScript(raw: unknown): { value: string | null; error: string | n
 
 async function listBlocks(env: Env): Promise<unknown[]> {
   const { results } = await env.DB.prepare(
-    "SELECT id,name,creator_name AS creator,hardness,light,colour,behaviour,rules_json,is_builtin,texture,texture_top,texture_bottom,model,script,drop_item_id,drop_qty FROM blocks ORDER BY is_builtin DESC,name LIMIT 500"
+    "SELECT id,name,creator_name AS creator,hardness,light,colour,behaviour,rules_json,is_builtin,texture,texture_top,texture_bottom,model,script,drop_item_id,drop_qty,pass_through FROM blocks ORDER BY is_builtin DESC,name LIMIT 500"
   ).all<BlockRow>();
   return results.map(row => ({
     id: row.id, name: row.name, creator: row.creator, hardness: row.hardness, light: row.light,
     colour: row.colour, behaviour: row.behaviour, is_builtin: row.is_builtin, rules: parseRules(row.rules_json),
     texture: row.texture ?? null, texture_top: row.texture_top ?? null, texture_bottom: row.texture_bottom ?? null,
     model: row.model ?? null, script: row.script ?? null,
-    drop_item_id: row.drop_item_id ?? null, drop_qty: row.drop_qty ?? 1
+    drop_item_id: row.drop_item_id ?? null, drop_qty: row.drop_qty ?? 1,
+    pass_through: row.pass_through ?? 0
   }));
 }
 
@@ -2385,9 +2387,10 @@ export default {
         const fullId = `player:${auth.user.username.toLowerCase()}:${namespace.toLowerCase()}:${id.toLowerCase()}`;
         try {
           await env.DB.prepare(
-            "INSERT INTO blocks(id,name,creator_id,creator_name,hardness,light,colour,behaviour,rules_json,is_builtin,texture,texture_top,texture_bottom,model,script,drop_item_id,drop_qty) VALUES(?,?,?,?,?,?,?,?,?,0,?,?,?,?,?,?,?)"
+            "INSERT INTO blocks(id,name,creator_id,creator_name,hardness,light,colour,behaviour,rules_json,is_builtin,texture,texture_top,texture_bottom,model,script,drop_item_id,drop_qty,pass_through) VALUES(?,?,?,?,?,?,?,?,?,0,?,?,?,?,?,?,?,?)"
           ).bind(fullId, name, auth.user.id, auth.user.username, hardness, light, colour, behaviour, JSON.stringify(rules),
-            appearance.value, topFace.value, bottomFace.value, model.value, script.value, dropItemId, dropQtyRaw).run();
+            appearance.value, topFace.value, bottomFace.value, model.value, script.value, dropItemId, dropQtyRaw,
+            data.pass_through ? 1 : 0).run();
         } catch {
           return err("That block ID already exists.", 409, origin);
         }
@@ -2440,9 +2443,10 @@ export default {
         if (!Number.isInteger(dropQtyRaw) || dropQtyRaw < 1 || dropQtyRaw > 99)
           return err("Drop quantity must be an integer from 1 to 99.", 400, origin);
         await env.DB.prepare(
-          "UPDATE blocks SET name=?,hardness=?,light=?,colour=?,behaviour=?,rules_json=?,texture=?,texture_top=?,texture_bottom=?,model=?,script=?,drop_item_id=?,drop_qty=?,updated_at=CURRENT_TIMESTAMP WHERE id=?"
+          "UPDATE blocks SET name=?,hardness=?,light=?,colour=?,behaviour=?,rules_json=?,texture=?,texture_top=?,texture_bottom=?,model=?,script=?,drop_item_id=?,drop_qty=?,pass_through=?,updated_at=CURRENT_TIMESTAMP WHERE id=?"
         ).bind(name, hardness, light, colour, behaviour, JSON.stringify(rules),
-          appearance.value, topFace.value, bottomFace.value, model.value, script.value, dropItemId, dropQtyRaw, id).run();
+          appearance.value, topFace.value, bottomFace.value, model.value, script.value, dropItemId, dropQtyRaw,
+          data.pass_through ? 1 : 0, id).run();
         return json({ ok: true }, 200, origin);
       }
 
